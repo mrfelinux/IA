@@ -1,0 +1,24 @@
+llama-server \
+  -hf empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF:Q8_0 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 6 \
+  --jinja \
+  --metrics \
+  --host 0.0.0.0 \
+  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 \
+  --presence-penalty 0.0 --repeat-penalty 1.05  \
+  -t 6  \
+  -ngl 99 \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  -c 131072 \
+  --flash-attn on \
+  --batch-size 2048 --ubatch-size 1024 --cont-batching \
+  --chat-template-kwargs '{"preserve_thinking": true}' \
+  --reasoning-preserve \
+  --reasoning-budget 2048 \
+  --reasoning-budget-message "OK, I've thought enough. Let's answer now." \
+  -n 16384 \
+  --parallel 1 \
+  --image-min-tokens 1024 \
+  --chat-template-file chat_template-qwythos.jinja

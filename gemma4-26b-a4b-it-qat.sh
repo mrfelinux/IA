@@ -1,0 +1,21 @@
+llama-server \
+-hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
+-ngl 99 \
+--ctx-size 133000 \
+--spec-type draft-mtp --spec-draft-n-max 4 \
+-np 1 \
+-fa on \
+--no-mmap \
+--mlock \
+--threads 6 \
+-b 1024 -ub 512 \
+-t 6 \
+-ctk q4_0 -ctv q4_0 \
+--temp 0.3 --top-p 0.9 --top-k 20 --min-p 0.05 \
+--presence-penalty 0.0 --repeat-penalty 1.15 --reasoning-budget -1 \
+--jinja \
+--metrics \
+--host 0.0.0.0 \
+--cache-ram 1024 \
+-n 256
+
