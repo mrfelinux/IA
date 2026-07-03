@@ -9,10 +9,14 @@ Scripts y herramientas para ejecutar, evaluar y probar modelos de lenguaje grand
 ├── *.sh                    # Scripts de lanzamiento de modelos
 ├── *.jinja                 # Chat templates personalizados (Jinja2)
 └── TEST-IA/
-    ├── eval_agentes.py     # Suite de evaluación (19 tests con informe)
-    ├── test-tools.py       # Prueba básica de tool calling
-    ├── test_tools_extended.py  # Prueba extendida (7 herramientas)
-    └── llama_bench_complete.py # Benchmarking de rendimiento
+    ├── eval_agentes.py                 # Suite de evaluación (19 tests con informe)
+    ├── eval_agentes-gemini2deepseek.py # Evaluación con cliente Gemini→DeepSeek
+    ├── comparador.py                   # Comparador de reportes JSON
+    ├── test-tools.py                   # Prueba básica de tool calling
+    ├── test_tools_extended.py          # Prueba extendida (7 herramientas)
+    ├── test_tools_extended_v2.py       # Prueba extendida v2
+    ├── llama_bench_complete.py         # Benchmarking de rendimiento
+    └── reporte_*.json                  # Reportes de evaluación generados
 ```
 
 ## Modelos disponibles
@@ -24,6 +28,8 @@ Scripts y herramientas para ejecutar, evaluar y probar modelos de lenguaje grand
 | `qwen36-35B-A3B.sh` | Qwen3.6 35B-A3B (MoE) | 132K ctx, IQ3_XXS, MTP-2 |
 | `qwen36-35B-A3B-AGENTWORLD.sh` | Qwen AgentWorld 35B | 120K ctx, IQ2_M, orientado a agentes |
 | `gemma4-26b-a4b-it-qat.sh` | Gemma 4 26B (QAT) | 133K ctx, Q4_K_XL, MTP-4 |
+| `gemma4-26b-a4b-it-qat-q4.sh` | Gemma 4 26B (QAT) | Q4_0, cuantización más agresiva |
+| `ornith.sh` | Ornith (Mythos 5 1M GGUF) | Variante experimental con Q6_K y Q8_0 |
 
 ## Chat templates
 
