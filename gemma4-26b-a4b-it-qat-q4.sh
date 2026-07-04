@@ -14,5 +14,7 @@ llama-server \
 --repeat-penalty 1 \
 --jinja \
 --metrics \
---host 0.0.0.0 
+--host 0.0.0.0 \
+-n 2048 \
+--reasoning-preserve
 

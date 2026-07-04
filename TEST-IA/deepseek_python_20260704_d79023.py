@@ -17,10 +17,8 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce
 from pathlib import Path
 from typing import Any, Never, Self
-
 from collections.abc import Callable
 
 import requests
@@ -30,7 +28,7 @@ import requests
 type ValidationTuple = tuple[bool, str, float]
 type TestResult = dict[str, Any]
 type ResultsMap = dict[str, TestResult]
-type MetricsMap = dict[str, int]
+type MetricsMap = dict[str, int | str]
 type ValidatorFn = Callable[[str], ValidationTuple]
 
 
@@ -43,6 +41,9 @@ class ServerConfig:
     metrics_endpoint: str
     timeout: int
     max_tokens: int
+    tests_filter: str | None = None
+    quiet: bool = False
+    log_file: str | None = None
 
     @classmethod
     def from_env(cls) -> Self:
@@ -53,6 +54,9 @@ class ServerConfig:
             metrics_endpoint=f"{host}/metrics",
             timeout=int(os.getenv("TIMEOUT", "120")),
             max_tokens=int(os.getenv("MAX_TOKENS", "4096")),
+            tests_filter=os.getenv("TESTS_FILTER"),
+            quiet=os.getenv("QUIET", "0").lower() in ("1", "true", "yes"),
+            log_file=os.getenv("LOG_FILE"),
         )
 
 
@@ -104,6 +108,70 @@ def extraer_codigo_python(respuesta: str) -> str:
     return respuesta
 
 
+def extraer_codigo_bash(respuesta: str) -> str:
+    """Extrae el contenido de un bloque de código bash de Markdown."""
+    patron = r'```(?:bash|sh)?\s*\n(.*?)\n```'
+    match = re.search(patron, respuesta, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return respuesta
+
+
+def extraer_json(respuesta: str) -> str:
+    """
+    Extrae la cadena JSON limpia de una respuesta que puede contener Markdown.
+    Busca bloque ```json, luego intenta respuesta completa, y como último
+    recurso busca el primer objeto/array JSON válido.
+    """
+    # 1. Buscar bloque de código ```json ... ```
+    patron_bloque = r'```(?:json)?\s*\n(.*?)\n```'
+    match = re.search(patron_bloque, respuesta, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    # 2. Intentar parsear la respuesta completa como JSON
+    try:
+        json.loads(respuesta.strip())
+        return respuesta.strip()
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Buscar objeto/array JSON con balanceado de llaves/corchetes
+    for start_char, end_char in [('{', '}'), ('[', ']')]:
+        start_idx = respuesta.find(start_char)
+        if start_idx == -1:
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start_idx, len(respuesta)):
+            ch = respuesta[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    candidate = respuesta[start_idx:i + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        break
+
+    return respuesta.strip()
+
+
 def calcular_score(parte_a: bool, parte_b: bool) -> float:
     """Calcula un score numérico: 1.0 ambas partes, 0.5 una parte, 0.0 ninguna."""
     match (parte_a, parte_b):
@@ -118,10 +186,11 @@ def calcular_score(parte_a: bool, parte_b: bool) -> float:
 # ─── Funciones de validación ─────────────────────────────────────────────────
 
 def validar_bash(respuesta: str) -> ValidationTuple:
-    tiene_rsync = "rsync" in respuesta
-    tiene_log = any(p in respuesta.lower() for p in ("log", "logger", "logrotate"))
-    tiene_error = any(p in respuesta.lower() for p in ("error", "retry", "trap"))
-    tiene_shebang = respuesta.strip().startswith("#!")
+    codigo = extraer_codigo_bash(respuesta)
+    tiene_rsync = "rsync" in codigo
+    tiene_log = any(p in codigo.lower() for p in ("log", "logger", "logrotate"))
+    tiene_error = any(p in codigo.lower() for p in ("error", "retry", "trap", "exit"))
+    tiene_shebang = bool(re.search(r'^\s*#!', codigo, re.MULTILINE))
 
     partes = [tiene_rsync, tiene_log, tiene_error, tiene_shebang]
     score = sum(partes) / len(partes)
@@ -158,31 +227,97 @@ def validar_python(respuesta: str) -> ValidationTuple:
 
 def validar_json(respuesta: str) -> ValidationTuple:
     try:
-        data = json.loads(respuesta)
-        match data:
-            case dict() as d if any(k in d for k in ("function", "tool", "arguments")):
-                return True, "JSON válido con estructura de tool calling.", 1.0
-            case dict():
-                return True, "JSON válido (sin estructura de tool calling).", 0.7
-            case _:
-                return True, "JSON válido.", 0.5
+        json_limpio = extraer_json(respuesta)
+        data = json.loads(json_limpio)
+        if not isinstance(data, dict):
+            return False, "JSON no es un objeto.", 0.3
+
+        # Verificar estructura de tool calling
+        nombre_funcion = None
+        argumentos = None
+
+        # Formato OpenAI: {"function": {"name": ..., "arguments": {...}}}
+        if "function" in data and isinstance(data["function"], dict):
+            nombre_funcion = data["function"].get("name", "")
+            argumentos = data["function"].get("arguments", {})
+        # Formato directo: {"name": ..., "arguments": {...}}
+        elif "name" in data:
+            nombre_funcion = data.get("name", "")
+            argumentos = data.get("arguments", {})
+        # Formato tool: {"tool": ..., "input": {...}}
+        elif "tool" in data:
+            nombre_funcion = data.get("tool", "")
+            argumentos = data.get("input", data.get("arguments", {}))
+
+        if not nombre_funcion:
+            return True, "JSON válido pero sin nombre de función.", 0.3
+
+        # Verificar que la función sea la esperada
+        funcion_esperada = "buscar_texto_en_archivos"
+        if nombre_funcion.lower() != funcion_esperada.lower():
+            return True, f"JSON válido pero función inesperada: '{nombre_funcion}'.", 0.5
+
+        # Verificar argumentos requeridos
+        if not isinstance(argumentos, dict):
+            return True, "JSON válido pero argumentos no son objeto.", 0.5
+
+        args_lower = {k.lower(): v for k, v in argumentos.items()}
+        campos_ok = sum(1 for c in ("directorio", "extension", "texto_busqueda") if c in args_lower)
+        score = 0.5 + (campos_ok / 3) * 0.5
+
+        if campos_ok == 3:
+            return True, "Tool call completa: función y 3 argumentos.", 1.0
+        elif campos_ok > 0:
+            return True, f"Tool call parcial: {campos_ok}/3 argumentos.", score
+        else:
+            return True, "Tool call sin argumentos esperados.", 0.5
+
     except json.JSONDecodeError:
         return False, "No es un JSON válido.", 0.0
 
 
 def validar_sql(respuesta: str) -> ValidationTuple:
-    tiene_ventanas = bool(re.search(r"(ROW_NUMBER|RANK|DENSE_RANK|OVER)\s*\(", respuesta, re.IGNORECASE))
-    tiene_from = bool(re.search(r"\bFROM\b", respuesta, re.IGNORECASE))
+    resp_upper = respuesta.upper()
 
-    match (tiene_ventanas, tiene_from):
-        case (True, True):
-            return True, "Window functions detectadas con FROM.", 1.0
-        case (True, False):
-            return False, "Window functions detectadas pero falta FROM.", 0.5
-        case (False, True):
-            return False, "FROM detectado pero sin window functions.", 0.5
-        case _:
-            return False, "No se detectaron window functions ni FROM.", 0.0
+    # Detectar window functions
+    tiene_over = bool(re.search(r'\bOVER\s*\(', respuesta, re.IGNORECASE))
+    tiene_row_number = bool(re.search(r'\bROW_NUMBER\s*\(', respuesta, re.IGNORECASE))
+    tiene_rank = bool(re.search(r'\b(?:RANK|DENSE_RANK)\s*\(', respuesta, re.IGNORECASE))
+    tiene_partition = bool(re.search(r'\bPARTITION\s+BY\b', respuesta, re.IGNORECASE))
+    window_func = tiene_over and (tiene_row_number or tiene_rank)
+
+    # Detectar estructura SQL válida
+    tiene_select = bool(re.search(r'\bSELECT\b', respuesta, re.IGNORECASE))
+    tiene_from = bool(re.search(r'\bFROM\b', respuesta, re.IGNORECASE))
+    tiene_join = bool(re.search(r'\b(?:INNER\s+)?JOIN\b', respuesta, re.IGNORECASE))
+    tiene_group = bool(re.search(r'\bGROUP\s+BY\b', respuesta, re.IGNORECASE))
+
+    # Verificar referencias a tablas del test
+    tiene_empleados = bool(re.search(r'\bempleados?\b', respuesta, re.IGNORECASE))
+    tiene_departamentos = bool(re.search(r'\bdepartamentos?\b', respuesta, re.IGNORECASE))
+
+    # Verificar columna salario
+    tiene_salario = bool(re.search(r'\bsalario\b', respuesta, re.IGNORECASE))
+
+    # Calcular score
+    componentes = [window_func, tiene_select, tiene_from, tiene_empleados or tiene_departamentos]
+    score = sum(componentes) / len(componentes)
+
+    # Bonus por PARTITION BY y tablas correctas
+    if window_func and tiene_partition and tiene_salario:
+        score = min(score + 0.2, 1.0)
+
+    if window_func and tiene_from:
+        msg = "Window functions con OVER y FROM detectados."
+        if tiene_partition:
+            msg += " PARTITION BY presente."
+        return True, msg, score
+    elif tiene_over and tiene_from:
+        return True, "OVER detectado pero sin función de ventana clara.", score * 0.7
+    elif tiene_from:
+        return False, "FROM detectado pero sin window functions.", 0.3
+    else:
+        return False, "No se detectaron window functions ni FROM.", 0.0
 
 
 def validar_pytest(respuesta: str) -> ValidationTuple:
@@ -232,25 +367,43 @@ def validar_go(respuesta: str) -> ValidationTuple:
 
 
 def validar_rust(respuesta: str) -> ValidationTuple:
-    tiene_fn = "fn " in respuesta
-    tiene_result = "Result<" in respuesta
-    tiene_option = "Option<" in respuesta
-    tiene_use = "use " in respuesta
+    codigo_match = re.search(r'```(?:rust)?\s*\n(.*?)\n```', respuesta, re.DOTALL | re.IGNORECASE)
+    codigo = codigo_match.group(1) if codigo_match else respuesta
 
-    partes = [tiene_fn, tiene_result or tiene_option, tiene_use]
-    score = sum(partes) / len(partes)
+    tiene_fn = bool(re.search(r'\bfn\s+\w+', codigo))
+    tiene_result = bool(re.search(r'Result\s*<', codigo))
+    tiene_option = bool(re.search(r'Option\s*<', codigo))
+    tiene_use = bool(re.search(r'\buse\s+', codigo))
+    tiene_return_arrow = '->' in codigo
 
+    score = 0.0
     if tiene_fn:
-        parts_msg = []
-        parts_msg.append("Funciones fn detectadas.")
-        if tiene_result or tiene_option:
-            parts_msg.append(" Manejo de Result/Option.")
-        else:
-            parts_msg.append(" Sin Result/Option.")
-        if not tiene_use:
-            parts_msg.append(" (sin use)")
-        return True, "".join(parts_msg), score
-    return False, "No se encontraron funciones 'fn'.", 0.0
+        score += 0.3
+    if tiene_result or tiene_option:
+        score += 0.3
+    if tiene_return_arrow:
+        score += 0.2
+    if tiene_use:
+        score += 0.2
+    if tiene_fn and tiene_result and (tiene_use or tiene_return_arrow):
+        score = 1.0
+
+    partes = []
+    if tiene_fn:
+        partes.append("Funciones fn detectadas")
+    else:
+        return False, "No se encontraron funciones 'fn'.", 0.0
+
+    if tiene_result or tiene_option:
+        partes.append("Result/Option")
+    else:
+        partes.append("Sin Result/Option")
+
+    if tiene_use:
+        partes.append(", use detectado")
+
+    msg = ". ".join(partes) + f". Score: {score:.2f}"
+    return True, msg, score
 
 
 def validar_js(respuesta: str) -> ValidationTuple:
@@ -289,21 +442,36 @@ def validar_traduccion(respuesta: str) -> ValidationTuple:
 
 
 def validar_seguridad(respuesta: str) -> ValidationTuple:
-    vuln = ["sql injection", "xss", "cross-site"]
-    mitigacion = ["escape", "sanitize", "validar", "prepared", "parameterized", "seguridad"]
+    resp_lower = respuesta.lower()
 
-    tiene_vuln = any(v in respuesta.lower() for v in vuln)
-    tiene_mitig = any(m in respuesta.lower() for m in mitigacion)
+    # Detectar identificación de vulnerabilidad
+    vuln_identificada = any(v in resp_lower for v in (
+        "sql injection", "inyección sql", "inyeccion sql", "sqli",
+        "vulnerable", "vulnerabilidad"
+    ))
 
-    score = calcular_score(tiene_vuln, tiene_mitig)
+    # Detectar código seguro real (no solo mención)
+    tiene_prepared = bool(re.search(r'(prepare|prepared|stmt|statement)', resp_lower))
+    tiene_parameterized = bool(re.search(r'(parametriz|parameterized|\?\s*,|%\s*s)', resp_lower))
+    tiene_bind = bool(re.search(r'(bind_param|bindvalue|bind_value|\$\w+\s*=)', resp_lower))
+    tiene_escape = bool(re.search(r'(escape|sanitiz|mysql_real_escape|htmlspecialchars)', resp_lower))
 
-    match (tiene_vuln, tiene_mitig):
-        case (True, True):
-            return True, "Vulnerabilidad y mitigación identificadas.", score
-        case (False, True):
-            return True, "Mitigación detectada sin identificar vulnerabilidad explícita.", 0.5
-        case _:
-            return False, "No se detectaron vulnerabilidades ni mitigaciones.", 0.0
+    # Verificar que haya CÓDIGO seguro, no solo teoría
+    tiene_codigo_php = bool(re.search(r'(\<\?php|\$conn|\$stmt|mysqli|pdo)', respuesta, re.IGNORECASE))
+    tiene_ejemplo = tiene_prepared or tiene_parameterized or tiene_bind or tiene_escape
+
+    score = calcular_score(vuln_identificada, tiene_ejemplo and tiene_codigo_php)
+
+    if vuln_identificada and tiene_ejemplo and tiene_codigo_php:
+        return True, "Vulnerabilidad identificada y mitigación con código seguro.", 1.0
+    elif vuln_identificada and tiene_ejemplo:
+        return True, "Vulnerabilidad y mitigación detectadas (sin código PHP).", 0.7
+    elif vuln_identificada:
+        return True, "Vulnerabilidad identificada pero mitigación débil.", 0.3
+    elif tiene_ejemplo:
+        return True, "Mitigación sin identificar vulnerabilidad explícita.", 0.5
+    else:
+        return False, "No se detectaron vulnerabilidades ni mitigaciones.", 0.0
 
 
 def validar_mutabilidad(respuesta: str) -> ValidationTuple:
@@ -330,54 +498,124 @@ def validar_mutabilidad(respuesta: str) -> ValidationTuple:
 
 def validar_optimizacion(respuesta: str) -> ValidationTuple:
     codigo = extraer_codigo_python(respuesta)
-    usa_set = "set(" in codigo or "set()" in codigo
-    usa_dict = "dict(" in codigo or "{}" in codigo
-    usa_comprension = re.search(r'\{.*for.*in.*\}', codigo) is not None
 
-    if usa_set:
-        return True, "Usa set() para optimización O(N).", 1.0
-    if usa_dict:
-        return True, "Usa dict para optimización O(N).", 1.0
-    if usa_comprension:
-        return True, "Usa comprensión para optimizar.", 1.0
-    return False, "No se detecta uso de set/dict; podría seguir siendo O(N^2).", 0.0
+    # Verificar uso real de set/dict (no solo en comentarios)
+    lineas_codigo = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
+    codigo_sin_comentarios = '\n'.join(lineas_codigo)
+
+    usa_set = bool(re.search(r'\bset\s*\(', codigo_sin_comentarios))
+    usa_dict = bool(re.search(r'\bdict\s*\(|\{[^}]*for\s+\w+\s+in', codigo_sin_comentarios))
+    usa_comprension = bool(re.search(r'\{[^}]*for\s+\w+\s+in[^}]*\}', codigo_sin_comentarios))
+    usa_counter = 'Counter' in codigo_sin_comentarios
+
+    # Verificar que no haya bucles anidados O(N^2)
+    tiene_bucles_anidados = bool(re.search(
+        r'for\s+\w+.*:.*\n\s+for\s+\w+', codigo_sin_comentarios
+    ))
+
+    optimizado = usa_set or usa_dict or usa_comprension or usa_counter
+
+    if optimizado:
+        metodo = []
+        if usa_set:
+            metodo.append("set()")
+        if usa_dict or usa_comprension:
+            metodo.append("dict/comprensión")
+        if usa_counter:
+            metodo.append("Counter")
+        msg = f"Optimización O(N) detectada: {', '.join(metodo)}."
+        if tiene_bucles_anidados:
+            msg += " (⚠️ posible bucle anidado residual)"
+            return True, msg, 0.7
+        return True, msg, 1.0
+    else:
+        return False, "No se detecta uso de set/dict/Counter; podría seguir siendo O(N²).", 0.0
 
 
 def validar_retry(respuesta: str) -> ValidationTuple:
     codigo = extraer_codigo_python(respuesta)
-    tiene_retry = "retry" in codigo.lower() or "intento" in codigo.lower() or "attempt" in codigo.lower()
-    tiene_backoff = (
-        "sleep" in codigo.lower()
-        and ("backoff" in codigo.lower() or "exponencial" in codigo.lower() or "2 **" in codigo or "2**" in codigo)
-    )
 
-    match (tiene_retry, tiene_backoff):
-        case (True, True):
-            return True, "Reintentos con backoff exponencial.", 1.0
-        case (True, False):
-            return True, "Reintentos detectados sin backoff exponencial.", 0.5
-        case _:
-            return False, "No se detecta mecanismo de reintentos.", 0.0
+    # Verificar implementación real de retry (no solo comentarios)
+    lineas_codigo = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
+    codigo_real = '\n'.join(lineas_codigo)
+
+    # Buscar loop/bucle de reintentos
+    tiene_loop = bool(re.search(r'for\s+\w+\s+in\s+range\s*\(', codigo_real))
+    tiene_while = bool(re.search(r'while\s+', codigo_real))
+
+    # Variable de control de intentos
+    tiene_retry_var = bool(re.search(r'(retry|attempt|intento|intentos?)\s*[=<>]', codigo_real, re.IGNORECASE))
+
+    # Backoff exponencial
+    tiene_sleep = 'sleep' in codigo_real.lower() or 'time.sleep' in codigo_real
+    tiene_backoff = bool(re.search(r'(backoff|exponencial|2\s*\*\*|2\s*\^\s*\w+|\*\s*2)', codigo_real, re.IGNORECASE))
+
+    # Verificar que haya un mecanismo de reintento real
+    tiene_mecanismo = tiene_loop or tiene_while or tiene_retry_var
+
+    if tiene_mecanismo and tiene_sleep and tiene_backoff:
+        return True, "Reintentos con backoff exponencial implementado.", 1.0
+    elif tiene_mecanismo and tiene_sleep:
+        return True, "Reintentos con sleep detectados (sin backoff claro).", 0.7
+    elif tiene_mecanismo:
+        return True, "Mecanismo de reintento detectado (sin sleep/backoff).", 0.5
+    elif tiene_retry_var or tiene_sleep:
+        return True, "Componentes de retry parciales.", 0.3
+    else:
+        return False, "No se detecta implementación real de reintentos.", 0.0
 
 
 def validar_extraccion_info(respuesta: str) -> ValidationTuple:
     try:
-        data = json.loads(respuesta)
+        json_limpio = extraer_json(respuesta)
+        data = json.loads(json_limpio)
         if not isinstance(data, dict):
             return False, "JSON no es un diccionario.", 0.0
 
-        claves_esperadas = {"personas", "lugares", "fechas", "organizaciones"}
-        claves_encontradas = claves_esperadas & set(data.keys())
+        # Claves esperadas (singular y plural)
+        grupos = {
+            "personas": ["personas", "persona", "people", "names", "nombre", "nombres"],
+            "lugares": ["lugares", "lugar", "places", "location", "ubicacion"],
+            "fechas": ["fechas", "fecha", "dates", "date"],
+            "organizaciones": ["organizaciones", "organizacion", "organizations", "company", "empresas"],
+        }
+
+        claves_encontradas = {}
+        for grupo, variantes in grupos.items():
+            for variante in variantes:
+                if variante in data:
+                    claves_encontradas[grupo] = data[variante]
+                    break
 
         if not claves_encontradas:
             return False, "JSON sin entidades esperadas.", 0.0
 
-        valores_no_vacios = all(bool(data[k]) for k in claves_encontradas)
-        score = calcular_score(bool(claves_encontradas), valores_no_vacios)
+        # Verificar que los valores sean listas y no vacías
+        valores_ok = 0
+        for grupo, valor in claves_encontradas.items():
+            if isinstance(valor, list) and len(valor) > 0:
+                valores_ok += 1
+            elif isinstance(valor, str) and valor.strip():
+                valores_ok += 1
 
-        if valores_no_vacios:
-            return True, f"Entidades extraídas: {', '.join(claves_encontradas)}.", score
-        return True, "Entidades encontradas pero con valores vacíos.", 0.5
+        total_grupos = len(grupos)
+        score = (len(claves_encontradas) / total_grupos) * 0.5 + (valores_ok / len(claves_encontradas)) * 0.5
+
+        # Verificar contenido específico del test
+        contenido_texto = json.dumps(data).lower()
+        tiene_openai = "openai" in contenido_texto
+        tiene_san_francisco = "san francisco" in contenido_texto
+        tiene_sam_altman = "sam altman" in contenido_texto or "altman" in contenido_texto
+        tiene_2023 = "2023" in contenido_texto
+
+        entidades_especificas = sum([tiene_openai, tiene_san_francisco, tiene_sam_altman, tiene_2023])
+
+        if valores_ok >= 3 and entidades_especificas >= 2:
+            return True, f"Entidades completas: {', '.join(claves_encontradas.keys())}.", 1.0
+        elif valores_ok >= 2:
+            return True, f"Entidades parciales: {', '.join(claves_encontradas.keys())}.", score
+        else:
+            return True, "Entidades encontradas pero con valores vacíos.", 0.3
 
     except json.JSONDecodeError:
         return False, "No es un JSON válido.", 0.0
@@ -385,69 +623,148 @@ def validar_extraccion_info(respuesta: str) -> ValidationTuple:
 
 def validar_tool_calling_avanzado(respuesta: str) -> ValidationTuple:
     try:
-        data = json.loads(respuesta)
+        json_limpio = extraer_json(respuesta)
+        data = json.loads(json_limpio)
         if not isinstance(data, list):
             return False, "JSON no es una lista.", 0.0
         if not data:
             return False, "Lista vacía.", 0.0
 
-        items_validos = sum(
-            1 for item in data
-            if isinstance(item, dict) and any(k in item for k in ("function", "tool", "name"))
-        )
-        score = items_validos / len(data)
+        # Funciones esperadas y sus argumentos clave
+        funciones_esperadas = {
+            "obtener_clima": ["ciudad", "city", "ubicacion", "location"],
+            "calcular_raiz": ["numero", "number", "num", "valor", "value"],
+            "enviar_correo": ["email", "correo", "destinatario", "to"],
+        }
+        funciones_encontradas = set()
+        argumentos_correctos = 0
+        items_validos = 0
 
-        match score:
-            case 1.0:
-                return True, f"Lista de tool calls válida ({len(data)} items).", score
-            case s if s > 0:
-                return True, f"Parcialmente válida: {items_validos}/{len(data)} items.", score
-            case _:
-                return False, "Ningún item tiene estructura de tool call.", 0.0
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            # Extraer nombre de función (múltiples formatos)
+            nombre = None
+            argumentos = None
+            if "function" in item and isinstance(item["function"], dict):
+                nombre = item["function"].get("name", "")
+                argumentos = item["function"].get("arguments", {})
+            elif "name" in item:
+                nombre = item.get("name", "")
+                argumentos = item.get("arguments", item.get("input", {}))
+            elif "tool" in item:
+                nombre = item.get("tool", "")
+                argumentos = item.get("input", item.get("arguments", {}))
+
+            if nombre:
+                items_validos += 1
+                nombre_lower = nombre.lower()
+
+                # Buscar coincidencia con funciones esperadas
+                for func_esperada, args_keys in funciones_esperadas.items():
+                    if func_esperada in nombre_lower or nombre_lower in func_esperada:
+                        funciones_encontradas.add(func_esperada)
+                        # Verificar argumentos
+                        if isinstance(argumentos, dict):
+                            args_lower = {k.lower(): v for k, v in argumentos.items()}
+                            if any(ak in args_lower for ak in args_keys):
+                                argumentos_correctos += 1
+                        break
+
+        total_esperadas = len(funciones_esperadas)
+        funciones_match = len(funciones_encontradas)
+        score = (funciones_match / total_esperadas) * 0.6 + (argumentos_correctos / total_esperadas) * 0.4
+
+        if funciones_match == total_esperadas and argumentos_correctos == total_esperadas:
+            return True, f"Lista válida: {total_esperadas} tool calls con argumentos.", 1.0
+        elif funciones_match == total_esperadas:
+            return True, f"Funciones correctas pero faltan argumentos ({argumentos_correctos}/{total_esperadas}).", score
+        elif funciones_match > 0:
+            faltan = funciones_esperadas.keys() - funciones_encontradas
+            return True, f"Parcial: {funciones_match}/{total_esperadas} funciones. Faltan: {', '.join(faltan)}.", score
+        else:
+            return False, f"Ninguna función esperada encontrada ({items_validos} items).", 0.0
 
     except json.JSONDecodeError:
         return False, "No es un JSON válido.", 0.0
 
+
 def validar_logica(respuesta: str) -> ValidationTuple:
     resp_lower = respuesta.lower()
-    tiene_personajes = "pollo" in resp_lower and "zorro" in resp_lower and ("maíz" in resp_lower or "grano" in resp_lower or "trigo" in resp_lower)
-    
-    tiene_retorno_pollo = any(
-        p in resp_lower for p in [
-            "vuelve con el pollo", "regresa con el pollo", "trae al pollo", 
-            "trae de vuelta al pollo", "lleva al pollo de vuelta", "llevar al pollo de vuelta", 
-            "regresar con el pollo", "volver con el pollo", "retorna con el pollo"
-        ]
-    ) or bool(re.search(r'(regres|volv|tra|retorn).{1,30}pollo', resp_lower))
-    
-    score = calcular_score(tiene_personajes, tiene_retorno_pollo)
-    
-    if tiene_personajes and tiene_retorno_pollo:
+
+    # Detectar personajes
+    tiene_pollo = "pollo" in resp_lower
+    tiene_zorro = "zorro" in resp_lower
+    tiene_grano = any(w in resp_lower for w in ("maíz", "maiz", "grano", "trigo", "grano de maíz"))
+    tiene_personajes = tiene_pollo and tiene_zorro and tiene_grano
+
+    # Detectar solución paso a paso (el pollo va primero)
+    tiene_paso1 = bool(re.search(
+        r'(paso\s*1|primero|1[°º\.]|en\s+el\s+primer|llev[ao]|cruz[ao]).{1,40}pollo',
+        resp_lower
+    ))
+
+    # Detectar retorno del pollo (paso crítico)
+    tiene_retorno = bool(re.search(
+        r'(regres|volv|tra|retorn|cruz[ao]\s+de\s+nuevo|segundo\s+viaje|devuelt).{1,40}pollo',
+        resp_lower
+    ))
+
+    # Detectar que zorro y grano quedan separados
+    tiene_separacion = bool(re.search(
+        r'(zorro.{1,20}grano|grano.{1,20}zorro|deja.{1,20}zorro.{1,20}grano)',
+        resp_lower
+    ))
+
+    # Verificar que la secuencia sea lógica
+    partes = [tiene_personajes, tiene_paso1, tiene_retorno]
+    score = sum(partes) / len(partes)
+
+    if tiene_personajes and tiene_retorno:
         return True, "Razonamiento lógico correcto: personajes y retorno del pollo detectados.", score
+    elif tiene_personajes and tiene_paso1:
+        return True, "Personajes correctos y primer paso, falta retorno del pollo.", score * 0.8
     elif tiene_personajes:
-        return False, "Falta la lógica del retorno del pollo (evitar que el zorro/pollo se coman algo).", score
+        return False, "Falta la lógica del retorno del pollo.", score
     else:
         return False, "No se identificaron los personajes o la lógica del acertijo.", score
 
 
 def validar_matematicas(respuesta: str) -> ValidationTuple:
     resp_lower = respuesta.lower()
-    tiene_metodo = "separac" in resp_lower or "separable" in resp_lower or "integr" in resp_lower
-    
-    tiene_solucion = bool(re.search(
-        r'(?:y\s*(?:\(x\))?\s*=\s*)?\b[CcKkAb]\s*\*?\s*(?:e\^x|e\^\{x\}|exp\s*\(\s*x\s*\))',
-        respuesta,
-        re.IGNORECASE
+    tiene_metodo = any(m in resp_lower for m in (
+        "separac", "separable", "integr", "variable separable",
+        "separación de variables", "separacion de variables"
     ))
-    
+
+    # Regex flexible para y = C*e^x (múltiples formatos)
+    tiene_solucion = bool(re.search(
+        r"""(?:y\s*(?:\(x\))?\s*=\s*)?     # opcional: y(x) =
+            [CKckABab]\s*                   # constante C/K/A/B
+            [*·×]?\s*                       # opcional: operador multiplicación
+            (?:e\s*\^?\s*(?:\{?\s*x\s*\}?  # e^x, e^{x}, e^ x
+            |exp\s*\(\s*x\s*\))            # exp(x)
+            |e\s*\^\s*x)                    # e^x
+        """,
+        respuesta,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+
+    # Detección adicional por texto
+    if not tiene_solucion:
+        tiene_solucion = bool(re.search(
+            r'y\s*=\s*[CcKk]\s*\*?\s*e\^?x', respuesta, re.IGNORECASE
+        ))
+
     score = calcular_score(tiene_metodo, tiene_solucion)
-    
+
     faltan = []
     if not tiene_metodo:
         faltan.append("explicación del método (separación de variables)")
     if not tiene_solucion:
         faltan.append("fórmula de la solución general (y = C*e^x)")
-        
+
     if score == 1.0:
         return True, "Ecuación resuelta: solución y método correctos.", 1.0
     else:
@@ -685,25 +1002,28 @@ def parsear_metricas(raw_metrics: str) -> MetricsMap:
         r'llamacpp:tokens_eval_total\s+(\d+)',
         r'llama\.cpp:tokens_predicted_total\s+(\d+)',
         r'llama\.cpp:tokens_eval_total\s+(\d+)',
+        r'tokens_(?:predicted|generated|completion)_total\s+(\d+)',
+        r'tokens_(?:eval|prompt)_total\s+(\d+)',
     ]
 
     for pat in patrones:
         match = re.search(pat, raw_metrics)
         if match:
-            if "predicted" in pat:
+            if "predicted" in pat or "generated" in pat or "completion" in pat:
                 datos['tokens_generados_totales'] = int(match.group(1))
-            elif "eval" in pat:
+            elif "eval" in pat or "prompt" in pat:
                 datos['tokens_prompt_totales'] = int(match.group(1))
 
-    if 'tokens_generados_totales' not in datos:
-        match = re.search(r'tokens_(?:predicted|generated|completion)_total\s+(\d+)', raw_metrics, re.IGNORECASE)
-        if match:
-            datos['tokens_generados_totales'] = int(match.group(1))
-
-    if 'tokens_prompt_totales' not in datos:
-        match = re.search(r'tokens_(?:eval|prompt)_total\s+(\d+)', raw_metrics, re.IGNORECASE)
-        if match:
-            datos['tokens_prompt_totales'] = int(match.group(1))
+    # Si no se encontraron métricas específicas, intentar sumar todas las que contengan "tokens"
+    if not datos:
+        tokens_total = 0
+        for line in raw_metrics.splitlines():
+            if "tokens" in line and "total" in line:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    tokens_total += int(parts[1])
+        if tokens_total:
+            datos['tokens_generados_totales'] = tokens_total  # asumimos que son generados
 
     datos.setdefault('tokens_generados_totales', 0)
     datos.setdefault('tokens_prompt_totales', 0)
@@ -730,7 +1050,13 @@ def ejecutar_prueba(nombre: str, datos_test: dict[str, str], cfg: ServerConfig) 
         data = resp.json()
         tiempo = round(time.monotonic() - inicio, 2)
 
-        contenido = data['choices'][0]['message']['content']
+        # Verificar que la respuesta tenga el formato esperado
+        if 'choices' not in data or not data['choices']:
+            raise ValueError("Respuesta del servidor sin 'choices'")
+        contenido = data['choices'][0].get('message', {}).get('content', '')
+        if not contenido:
+            raise ValueError("Contenido vacío en la respuesta")
+
         usage = data.get('usage', {})
         prompt_tk = usage.get('prompt_tokens', 0)
         completion_tk = usage.get('completion_tokens', 0)
@@ -774,7 +1100,7 @@ def ejecutar_prueba(nombre: str, datos_test: dict[str, str], cfg: ServerConfig) 
         }
 
 
-# ─── Salida en consola ───────────────────────────────────────────────────────
+# ─── Salida en consola (optimizada) ─────────────────────────────────────────
 
 def print_header(texto: str) -> None:
     print()
@@ -783,14 +1109,20 @@ def print_header(texto: str) -> None:
     print(c(Color.CYAN + Color.BOLD, "=" * 70))
 
 
-def print_test_progreso(indice: int, total: int, nombre: str, categoria: str) -> None:
+def print_test_progreso(indice: int, total: int, nombre: str, categoria: str, quiet: bool = False) -> None:
+    if quiet:
+        return
     prefijo = c(Color.BLUE, f"[{indice:02d}/{total:02d}]")
-    print(f"  {prefijo} {c(Color.BOLD, categoria)} -> {c(Color.GRAY, nombre)}", end="", flush=True)
+    # Usar \r para sobreescribir la línea
+    sys.stdout.write(f"\r  {prefijo} {c(Color.BOLD, categoria)} -> {c(Color.GRAY, nombre)} ... ")
+    sys.stdout.flush()
 
 
-def print_test_resultado(res: TestResult) -> None:
+def print_test_resultado(res: TestResult, quiet: bool = False) -> None:
+    if quiet:
+        return
     if res.get("error"):
-        print(f" {c(Color.RED, 'ERROR')} {c(Color.RED, str(res['error'][:60]))}")
+        print(f"{c(Color.RED, 'ERROR')} {c(Color.RED, str(res['error'][:60]))}")
         return
 
     tps = res.get("tps_generacion", 0)
@@ -800,6 +1132,10 @@ def print_test_resultado(res: TestResult) -> None:
     score = res.get("valida_score", 0.0)
     val_msg = res.get("valida_msg", "")
 
+    # Acortar mensaje de validación si es muy largo
+    if len(val_msg) > 40:
+        val_msg = val_msg[:37] + "..."
+
     match (res.get("valida_ok"), score >= 0.5):
         case (True, _):
             icono = c(Color.GREEN, "OK")
@@ -808,6 +1144,7 @@ def print_test_resultado(res: TestResult) -> None:
         case _:
             icono = c(Color.RED, "FAIL")
 
+    # Mostrar solo el resultado, sin repetir la línea de progreso
     print(f" {icono} {tiempo:.1f}s | {tps:.1f} TPS | {pt}/{gt} tk | {val_msg[:50]}")
 
 
@@ -852,10 +1189,15 @@ def print_resumen_final(
     tps_lista: list[float],
 ) -> None:
     total = len(resultados)
-    exitos = sum(1 for r in resultados.values() if r.get("valida_ok") and not r.get("error"))
+    exitos = sum(
+        1 for r in resultados.values()
+        if r.get("valida_ok") and r.get("valida_score", 0) == 1.0 and not r.get("error")
+    )
     parciales = sum(
         1 for r in resultados.values()
-        if not r.get("valida_ok") and r.get("valida_score", 0) >= 0.5 and not r.get("error")
+        if not r.get("error")
+        and r.get("valida_score", 0) >= 0.5
+        and not (r.get("valida_ok") and r.get("valida_score", 0) == 1.0)
     )
     errores = sum(1 for r in resultados.values() if r.get("error"))
     fallos = total - exitos - parciales - errores
@@ -905,14 +1247,18 @@ def print_resumen_final(
 
 def _calcular_estadisticas(resultados: ResultsMap) -> dict[str, int]:
     """Calcula estadísticas de resultados de forma funcional."""
-    return {
-        "exitos": sum(1 for r in resultados.values() if r.get("valida_ok") and not r.get("error")),
-        "parciales": sum(
-            1 for r in resultados.values()
-            if not r.get("valida_ok") and r.get("valida_score", 0) >= 0.5 and not r.get("error")
-        ),
-        "errores": sum(1 for r in resultados.values() if r.get("error")),
-    }
+    exitos = sum(
+        1 for r in resultados.values()
+        if r.get("valida_ok") and r.get("valida_score", 0) == 1.0 and not r.get("error")
+    )
+    parciales = sum(
+        1 for r in resultados.values()
+        if not r.get("error")
+        and r.get("valida_score", 0) >= 0.5
+        and not (r.get("valida_ok") and r.get("valida_score", 0) == 1.0)
+    )
+    errores = sum(1 for r in resultados.values() if r.get("error"))
+    return {"exitos": exitos, "parciales": parciales, "errores": errores}
 
 
 def _construir_informe(
@@ -944,7 +1290,7 @@ def _construir_informe(
         "resumen": {
             "pruebas_exitosas": stats["exitos"],
             "pruebas_parciales": stats["parciales"],
-            "pruebas_fallidas": total - stats["exitos"] - stats["parciales"],
+            "pruebas_fallidas": total - stats["exitos"] - stats["parciales"] - stats["errores"],
             "pruebas_con_error": stats["errores"],
             "porcentaje_exito": f"{stats['exitos'] / total * 100:.1f}%" if total > 0 else "0%",
             "tiempo_total": round(tiempo_total, 2),
@@ -968,15 +1314,30 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     tiempo_total = 0.0
     tps_lista: list[float] = []
 
-    print_header("EVALUACION DE MODELO EN LLAMA.CPP")
+    if not cfg.quiet:
+        print_header("EVALUACION DE MODELO EN LLAMA.CPP")
 
     nombre_modelo = obtener_nombre_modelo(cfg)
-    print(f"\n  {c(Color.BOLD, 'Modelo detectado:')} {c(Color.CYAN, nombre_modelo)}")
-    print(f"  {c(Color.BOLD, 'Host:')} {cfg.host}")
-    print(f"  {c(Color.BOLD, 'Timeout:')} {cfg.timeout}s | {c(Color.BOLD, 'Max tokens:')} {cfg.max_tokens}")
-    print()
+    if not cfg.quiet:
+        print(f"\n  {c(Color.BOLD, 'Modelo detectado:')} {c(Color.CYAN, nombre_modelo)}")
+        print(f"  {c(Color.BOLD, 'Host:')} {cfg.host}")
+        print(f"  {c(Color.BOLD, 'Timeout:')} {cfg.timeout}s | {c(Color.BOLD, 'Max tokens:')} {cfg.max_tokens}")
+        print()
 
-    total_tests = len(TEST_SUITE)
+    # Filtrar tests si se especificó --tests (soporte para rangos, ej. "1-5,7")
+    items: list[tuple[str, dict[str, str]]] = list(TEST_SUITE.items())
+    if cfg.tests_filter:
+        test_ids = []
+        for part in cfg.tests_filter.split(","):
+            part = part.strip()
+            if "-" in part:
+                start, end = part.split("-")
+                test_ids.extend(range(int(start), int(end)+1))
+            else:
+                test_ids.append(int(part))
+        items = [(k, v) for i, (k, v) in enumerate(items, 1) if i in test_ids]
+
+    total_tests = len(items)
 
     # Handler para Ctrl+C
     interrumpido = False
@@ -984,18 +1345,21 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     def signal_handler(sig: int, frame: Any) -> None:
         nonlocal interrumpido
         interrumpido = True
-        print(f"\n\n{c(Color.YELLOW, ' Interrupcion detectada. Guardando resultados parciales...')}")
+        if not cfg.quiet:
+            print(f"\n\n{c(Color.YELLOW, ' Interrupcion detectada. Guardando resultados parciales...')}")
 
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        for i, (nombre_test, datos_test) in enumerate(TEST_SUITE.items(), 1):
+        for i, (nombre_test, datos_test) in enumerate(items, 1):
             if interrumpido:
                 break
-            print_test_progreso(i, total_tests, nombre_test, datos_test["categoria"])
+            if not cfg.quiet:
+                print_test_progreso(i, total_tests, nombre_test, datos_test["categoria"])
             res = ejecutar_prueba(nombre_test, datos_test, cfg)
             resultados_informe[nombre_test] = res
-            print_test_resultado(res)
+            if not cfg.quiet:
+                print_test_resultado(res)
 
             if (not nombre_modelo or "Desconocido" in nombre_modelo) and not res.get("error") and res.get("model"):
                 nombre_modelo = res.get("model")
@@ -1010,6 +1374,10 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     finally:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+    # Si se interrumpió, añadir una nueva línea para separar
+    if interrumpido and not cfg.quiet:
+        print()
+
     # Métricas del servidor
     metricas_raw = obtener_metricas(cfg)
     metricas_parseadas = parsear_metricas(metricas_raw)
@@ -1018,7 +1386,8 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     tps_promedio = round(sum(tps_lista) / len(tps_lista), 2) if tps_lista else 0
 
     # Resumen en consola
-    print_tabla_resumen(resultados_informe)
+    if not cfg.quiet:
+        print_tabla_resumen(resultados_informe)
     print_resumen_final(
         nombre_modelo, resultados_informe,
         total_prompt_tokens, total_completion_tokens,
@@ -1045,9 +1414,19 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
         encoding="utf-8",
     )
 
-    print(c(Color.BOLD, f"  JSON guardado: {c(Color.CYAN, str(filename_json))}"))
-    print(c(Color.CYAN, "=" * 70))
-    print()
+    if not cfg.quiet:
+        print(c(Color.BOLD, f"  JSON guardado: {c(Color.CYAN, str(filename_json))}"))
+        print(c(Color.CYAN, "=" * 70))
+        print()
+
+    # Opcional: guardar log a archivo si se especificó
+    if cfg.log_file:
+        log_path = Path(cfg.log_file)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} - Evaluación completada para {nombre_modelo}\n")
+            f.write(f"  Exitosos: {stats['exitos']}/{len(resultados_informe)}\n")
+            f.write(f"  TPS promedio: {tps_promedio:.2f}\n")
+            f.write(f"  Tiempo total: {tiempo_total:.2f}s\n\n")
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -1078,7 +1457,18 @@ def parse_args() -> ServerConfig:
         "--tests",
         type=str,
         default=None,
-        help="IDs de tests a ejecutar, separados por coma (ej: 1,3,5)",
+        help="IDs de tests a ejecutar, separados por coma; soporta rangos (ej: 1,3-5,7)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suprime la salida detallada (solo muestra el resumen final).",
+    )
+    parser.add_argument(
+        "--log",
+        type=str,
+        default=None,
+        help="Archivo de log para registrar resultados (append).",
     )
 
     args = parser.parse_args()
@@ -1089,6 +1479,9 @@ def parse_args() -> ServerConfig:
         metrics_endpoint=f"{args.host}/metrics",
         timeout=args.timeout,
         max_tokens=args.max_tokens,
+        tests_filter=args.tests,
+        quiet=args.quiet,
+        log_file=args.log,
     )
 
 

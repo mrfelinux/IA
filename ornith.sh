@@ -37,8 +37,6 @@ llama-server \
     -ngl "$NGL" \
     -b "$BATCH_SIZE" \
     --ubatch-size "$UBATCH_SIZE" \
-    --cache-type-k "$CACHE_TYPE_K" \
-    --cache-type-v "$CACHE_TYPE_V" \
     --temp "$TEMP" \
     --top-p "$TOP_P" \
     --top_k "$TOP_K" \
