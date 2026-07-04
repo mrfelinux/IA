@@ -1,15 +1,14 @@
 llama-server \
--hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
+-hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
 -ngl 99 \
 --ctx-size $((128*1024)) \
 --spec-type draft-mtp --spec-draft-n-max 4 \
 -np 1 \
--ctk q4_0 -ctv q4_0 \
 -fa on \
 --mmap \
 --mlock \
 -t 6 \
---temp 0.6 --top-p 0.95 --top-k 64 \
+--temp 1 --top-p 0.95 --top-k 64 \
 --jinja \
 --metrics \
 --host 0.0.0.0 \

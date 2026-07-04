@@ -43,6 +43,7 @@ class ServerConfig:
     metrics_endpoint: str
     timeout: int
     max_tokens: int
+    tests_filter: str | None = None
 
     @classmethod
     def from_env(cls) -> Self:
@@ -882,10 +883,15 @@ def print_resumen_final(
     tps_lista: list[float],
 ) -> None:
     total = len(resultados)
-    exitos = sum(1 for r in resultados.values() if r.get("valida_ok") and not r.get("error"))
+    exitos = sum(
+        1 for r in resultados.values()
+        if r.get("valida_ok") and r.get("valida_score", 0) == 1.0 and not r.get("error")
+    )
     parciales = sum(
         1 for r in resultados.values()
-        if not r.get("valida_ok") and r.get("valida_score", 0) >= 0.5 and not r.get("error")
+        if not r.get("error")
+        and r.get("valida_score", 0) >= 0.5
+        and not (r.get("valida_ok") and r.get("valida_score", 0) == 1.0)
     )
     errores = sum(1 for r in resultados.values() if r.get("error"))
     fallos = total - exitos - parciales - errores
@@ -935,14 +941,18 @@ def print_resumen_final(
 
 def _calcular_estadisticas(resultados: ResultsMap) -> dict[str, int]:
     """Calcula estadísticas de resultados de forma funcional."""
-    return {
-        "exitos": sum(1 for r in resultados.values() if r.get("valida_ok") and not r.get("error")),
-        "parciales": sum(
-            1 for r in resultados.values()
-            if not r.get("valida_ok") and r.get("valida_score", 0) >= 0.5 and not r.get("error")
-        ),
-        "errores": sum(1 for r in resultados.values() if r.get("error")),
-    }
+    exitos = sum(
+        1 for r in resultados.values()
+        if r.get("valida_ok") and r.get("valida_score", 0) == 1.0 and not r.get("error")
+    )
+    parciales = sum(
+        1 for r in resultados.values()
+        if not r.get("error")
+        and r.get("valida_score", 0) >= 0.5
+        and not (r.get("valida_ok") and r.get("valida_score", 0) == 1.0)
+    )
+    errores = sum(1 for r in resultados.values() if r.get("error"))
+    return {"exitos": exitos, "parciales": parciales, "errores": errores}
 
 
 def _construir_informe(
@@ -974,7 +984,7 @@ def _construir_informe(
         "resumen": {
             "pruebas_exitosas": stats["exitos"],
             "pruebas_parciales": stats["parciales"],
-            "pruebas_fallidas": total - stats["exitos"] - stats["parciales"],
+            "pruebas_fallidas": total - stats["exitos"] - stats["parciales"] - stats["errores"],
             "pruebas_con_error": stats["errores"],
             "porcentaje_exito": f"{stats['exitos'] / total * 100:.1f}%" if total > 0 else "0%",
             "tiempo_total": round(tiempo_total, 2),
@@ -1006,7 +1016,13 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     print(f"  {c(Color.BOLD, 'Timeout:')} {cfg.timeout}s | {c(Color.BOLD, 'Max tokens:')} {cfg.max_tokens}")
     print()
 
-    total_tests = len(TEST_SUITE)
+    # Filtrar tests si se especificó --tests
+    items: list[tuple[str, dict[str, str]]] = list(TEST_SUITE.items())
+    if cfg.tests_filter:
+        test_ids = [int(x.strip()) for x in cfg.tests_filter.split(",")]
+        items = [(k, v) for i, (k, v) in enumerate(items, 1) if i in test_ids]
+
+    total_tests = len(items)
 
     # Handler para Ctrl+C
     interrumpido = False
@@ -1019,7 +1035,7 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        for i, (nombre_test, datos_test) in enumerate(TEST_SUITE.items(), 1):
+        for i, (nombre_test, datos_test) in enumerate(items, 1):
             if interrumpido:
                 break
             print_test_progreso(i, total_tests, nombre_test, datos_test["categoria"])
@@ -1119,6 +1135,7 @@ def parse_args() -> ServerConfig:
         metrics_endpoint=f"{args.host}/metrics",
         timeout=args.timeout,
         max_tokens=args.max_tokens,
+        tests_filter=args.tests,
     )
 
 
