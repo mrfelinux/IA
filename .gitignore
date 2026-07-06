@@ -40,3 +40,13 @@ reporte_*.json
 
 # Environment (prod/ci)
 .env
+
+# Caches y herramientas
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Agent artifacts (opencode, etc.)
+.atl/
+.agents/
+.codex/

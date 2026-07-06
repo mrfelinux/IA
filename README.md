@@ -6,20 +6,23 @@ Scripts y herramientas para ejecutar, evaluar y probar modelos de lenguaje grand
 
 ```
 .
-├── *.sh                    # Scripts de lanzamiento de modelos (13)
-├── *.jinja                 # Chat templates personalizados (Jinja2)
-├── .env.example            # Ejemplo de configuración de entorno
-├── pyproject.toml          # Dependencias Python
-└── TEST-IA/
-    ├── ia-test.py                      # Suite de evaluación (19 tests con informe)
-    ├── comparador.py                   # Comparador de reportes JSON
-    ├── llama_bench_complete.py         # Benchmarking de rendimiento
-    ├── test-tools.py                   # Prueba básica de tool calling
-    ├── test_tools_extended.py          # Prueba extendida (7 herramientas)
-    ├── test_tools_extended_v2.py       # Prueba extendida v2
-    ├── tools_defs.py                   # Definiciones compartidas de herramientas
-    ├── reporte_*.json                  # Reportes de evaluación generados
-    └── package.json                    # Metadatos del proyecto (Node.js)
+├── *.sh                         # Scripts de lanzamiento de modelos (13)
+├── templates/
+│   └── *.jinja                  # Chat templates personalizados (Jinja2, 6)
+├── .env.example                 # Ejemplo de configuración de entorno
+├── .gga                         # Config de code review (Gentle Guardian Angel)
+├── pyproject.toml               # Dependencias Python
+├── AGENTS.md                    # Reglas para asistentes AI
+├── TEST-IA/
+│   ├── ia-test.py               # Suite de evaluación (19 tests con informe)
+│   ├── comparador.py            # Comparador de reportes JSON
+│   ├── llama_bench_complete.py  # Benchmarking de rendimiento
+│   ├── test-tools.py            # Prueba básica de tool calling
+│   ├── test_tools_extended.py   # Prueba extendida (7 herramientas)
+│   ├── test_tools_extended_v2.py# Prueba extendida v2
+│   ├── tools_defs.py            # Definiciones compartidas de herramientas
+│   ├── tests/                   # Tests unitarios (pytest)
+│   └── reporte_*.json           # Reportes de evaluación generados
 ```
 
 ## Modelos disponibles
@@ -42,14 +45,16 @@ Scripts y herramientas para ejecutar, evaluar y probar modelos de lenguaje grand
 
 ## Chat templates
 
-Templates Jinja2 personalizados para distintos formatos de tool calling y razonamiento:
+Templates Jinja2 personalizados para distintos formatos de tool calling y razonamiento, ubicados en `templates/`:
 
-- `chat_template.jinja` — Qwythos con tool calls `XML` y bloque `<think>`
-- `chat_template2.jinja` — Qwen3.6 v20: detección de errores, truncamiento, multi-step tool calls
-- `chat_template-gemini4.jinja` — Formato Gemini-style con `item.properties`
-- `chat_template-tollcall.jinja` — Formato toll-call con descripciones inline
-- `chat_template-qwythos.jinja` — Variante Qwythos
-- `ornith_template.jinja` — Template para Ornith
+| Archivo | Descripción |
+|---------|-------------|
+| `chat_template.jinja` | Qwythos con tool calls XML y bloque `<think>` |
+| `chat_template2.jinja` | Qwen3.6 v20: detección de errores, truncamiento, multi-step |
+| `chat_template-gemini4.jinja` | Formato Gemini-style con `item.properties` |
+| `chat_template-tollcall.jinja` | Formato toll-call con descripciones inline |
+| `chat_template-qwythos.jinja` | Variante Qwythos |
+| `ornith_template.jinja` | Template para Ornith |
 
 ## Configuración
 
@@ -64,7 +69,6 @@ Las siguientes variables de entorno modifican el comportamiento de la suite de p
 | `LOG_FILE` | _(ninguno)_ | Ruta para guardar log de evaluación |
 | `TESTS_FILTER` | _(ninguno)_ | Filtrar tests por nombre (subcadena) |
 
-Ejemplo:
 ```bash
 LLAMA_HOST=http://192.168.1.10:8080 TIMEOUT=300 QUIET=1 python TEST-IA/ia-test.py
 ```
