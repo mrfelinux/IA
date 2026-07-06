@@ -12,13 +12,12 @@ import ast
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 # ─── Dynamic import for ia-test.py (hyphen in filename) ───────────────────────
 _TEST_IA_DIR = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
     "ia_test_source", str(_TEST_IA_DIR / "ia-test.py")
 )
+assert _spec is not None and _spec.loader is not None
 _ia_test = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ia_test)
 

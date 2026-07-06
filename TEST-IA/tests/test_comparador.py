@@ -12,13 +12,12 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 # ─── Dynamic import for comparador.py ─────────────────────────────────────────
 _TEST_IA_DIR = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
     "comparador_source", str(_TEST_IA_DIR / "comparador.py")
 )
+assert _spec is not None and _spec.loader is not None
 _comparador = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_comparador)
 
