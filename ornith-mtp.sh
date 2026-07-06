@@ -9,7 +9,7 @@ set -euo pipefail
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=1
 
 # Configuración del modelo y servidor
-MODEL_HF="deepreinforce-ai/Ornith-1.0-9B-GGUF:Q8_0"
+MODEL_HF="protoLabsAI/Ornith-1.0-9B-MTP-GGUF:Q8_0"
 # Alternativa de mayor calidad: "deepreinforce-ai/Ornith-1.0-9B-GGUF:UD-Q4_K_XL"
 PORT=8080
 HOST="0.0.0.0"
@@ -52,4 +52,5 @@ llama-server \
     --repeat-penalty 1.0 \
     --chat-template-file ornith_template.jinja \
     -np 1 \
-    --chat-template-kwargs '{"enable_thinking":true}'
+    --chat-template-kwargs '{"enable_thinking":true}' \
+    --spec-type draft-mtp --spec-draft-n-max 3

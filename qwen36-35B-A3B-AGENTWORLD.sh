@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 llama-server \
   -hf unsloth/Qwen-AgentWorld-35B-A3B-GGUF:UD-IQ2_M \

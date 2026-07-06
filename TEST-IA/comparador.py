@@ -9,9 +9,18 @@ import json
 import glob
 import os
 import sys
+from typing import Any
+from collections.abc import Callable
+
 import requests
 from datetime import datetime
 from collections import OrderedDict
+
+# ─── Type aliases (PEP 695 ─ Python 3.12+) ──────────────────────────────────
+
+type ReportsDict = dict[str, Any]
+type MetricsDict = dict[str, int | str]
+type CategoryScores = dict[str, dict[str, float]]
 
 # ─── ANSI ───────────────────────────────────────────────────────────────────
 R = "\033[91m"; G = "\033[92m"; Y = "\033[93m"; B = "\033[94m"; M = "\033[95m"
@@ -23,9 +32,9 @@ LOCAL_MODEL_URL = "http://localhost:8080"
 LOCAL_MODEL_TIMEOUT = 120
 
 
-def safe_get(data, *keys, default=None):
+def safe_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
     """Obtiene un valor anidado de forma segura."""
-    current = data
+    current: Any = data
     for key in keys:
         if isinstance(current, dict) and key in current:
             current = current[key]
@@ -34,19 +43,19 @@ def safe_get(data, *keys, default=None):
     return current
 
 
-def bar(val, maxv, w=20, color=G):
+def bar(val: float, maxv: float, w: int = 20, color: str = G) -> str:
     """Barra horizontal."""
     filled = round((val / maxv) * w) if maxv else 0
     bar_str = "█" * filled + "░" * (w - filled)
     return f"{color}{bar_str}{N}"
 
 
-def pct_bar(val, w=20):
+def pct_bar(val: float, w: int = 20) -> str:
     """Barra de porcentaje 0-100."""
     return bar(val, 100, w, G if val >= 80 else (Y if val >= 50 else R))
 
 
-def header(text):
+def header(text: str) -> str:
     try:
         cols = os.get_terminal_size().columns
     except OSError:
@@ -55,11 +64,11 @@ def header(text):
     return f"\n{BO}{C}{'═'*side}  {text}  {'═'*side}{N}"
 
 
-def subheader(text):
+def subheader(text: str) -> str:
     return f"\n{BO}{B}▸ {text}{N}"
 
 
-def format_model_name(name):
+def format_model_name(name: str) -> str:
     """Acorta el nombre del modelo para visualización."""
     short = name.split("/")[-1]
     for suffix in ["-GGUF", ":Q8_0", ":Q4_K_M", ":Q4_K_XL", ":UD-Q4_K_XL"]:
@@ -70,9 +79,9 @@ def format_model_name(name):
 
 
 # ─── CARGA DE REPORTES ──────────────────────────────────────────────────────
-def load_reports(base_dir):
+def load_reports(base_dir: str) -> ReportsDict:
     """Carga todos los reportes JSON del directorio."""
-    reports = {}
+    reports: ReportsDict = {}
     json_files = sorted(glob.glob(os.path.join(base_dir, "reporte_*.json")))
 
     if not json_files:
@@ -95,7 +104,7 @@ def load_reports(base_dir):
 
 
 # ─── ANÁLISIS CON MODELO LOCAL ──────────────────────────────────────────────
-def query_local_model(prompt, max_tokens=4096):
+def query_local_model(prompt: str, max_tokens: int = 4096) -> str | None:
     """Consulta el modelo local para análisis inteligente."""
     try:
         payload = {
@@ -121,7 +130,7 @@ def query_local_model(prompt, max_tokens=4096):
         return None
 
 
-def generate_intelligent_analysis(reports_data):
+def generate_intelligent_analysis(reports_data: ReportsDict) -> str | None:
     """Genera análisis inteligente usando el modelo local."""
     # Preparar datos resumidos para el prompt
     summary = []
@@ -182,7 +191,7 @@ Responde en formato markdown conciso."""
         return None
 
 
-def format_markdown_analysis(text):
+def format_markdown_analysis(text: str | None) -> str | None:
     """Da formato ANSI atractivo a la salida markdown del análisis."""
     if not text:
         return text
@@ -227,7 +236,7 @@ def format_markdown_analysis(text):
 
 
 # ─── SECCIONES DEL INFORME ──────────────────────────────────────────────────
-def section_summary(reports, groups):
+def section_summary(reports: ReportsDict, groups: OrderedDict[str, list[ReportsDict]]) -> None:
     """Sección 1: Tabla resumen general."""
     print(header("1. RESUMEN GLOBAL POR MODELO"))
     # Compute dynamic column widths based on formatted model names
@@ -276,7 +285,7 @@ def section_summary(reports, groups):
         print(row_line)
 
 
-def section_metrics(groups):
+def section_metrics(groups: OrderedDict[str, list[ReportsDict]]) -> dict[str, dict[str, float]]:
     """Sección 2: Métricas de rendimiento con barras."""
     print(header("2. MÉTRICAS DE RENDIMIENTO (PROMEDIO POR MODELO)"))
 
@@ -321,7 +330,7 @@ def section_metrics(groups):
     return metrics
 
 
-def section_categories(groups):
+def section_categories(groups: OrderedDict[str, list[ReportsDict]]) -> CategoryScores:
     """Sección 3: Desglose por categoría."""
     print(header("3. DESGLOSE POR CATEGORÍA (SCORE PROMEDIO)"))
 
@@ -372,7 +381,7 @@ def section_categories(groups):
     return cat_scores
 
 
-def section_weaknesses(cat_scores):
+def section_weaknesses(cat_scores: CategoryScores) -> None:
     """Sección 4: Mapa de debilidades."""
     print(header("4. MAPA DE DEBILIDADES (SCORE < 70%)"))
 
@@ -400,7 +409,7 @@ def section_weaknesses(cat_scores):
         print(f"\n  {G}✓ Ninguna debilidad crítica (score < 70%) en los promedios{N}")
 
 
-def section_variability(reports, groups):
+def section_variability(reports: ReportsDict, groups: OrderedDict[str, list[ReportsDict]]) -> None:
     """Sección 5: Análisis de variabilidad para modelos con múltiples runs."""
     print(header("5. ANÁLISIS DE VARIABILIDAD"))
 
@@ -437,7 +446,7 @@ def section_variability(reports, groups):
             print(f"  {info['label']:<22} {avg:>4.0f}% {lo:>4.0f}% {hi:>4.0f}% {spc}{spread:>4.0f}pp{N}")
 
 
-def section_ranking(metrics):
+def section_ranking(metrics: dict[str, dict[str, float]]) -> None:
     """Sección 6: Ranking final y recomendaciones."""
     print(header("6. RANKING FINAL Y RECOMENDACIONES"))
 
@@ -477,7 +486,7 @@ def section_ranking(metrics):
 """)
 
 
-def section_visual(metrics):
+def section_visual(metrics: dict[str, dict[str, float]]) -> None:
     """Sección 7: Gráfico comparativo visual."""
     print(header("7. COMPARATIVA VISUAL (FIABILIDAD vs VELOCIDAD)"))
 
@@ -507,7 +516,7 @@ def section_visual(metrics):
 
 
 # ─── MAIN ───────────────────────────────────────────────────────────────────
-def main():
+def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
     print(f"\n{BO}{M}{'█'*70}{N}")

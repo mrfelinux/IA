@@ -28,3 +28,15 @@ Thumbs.db
 # Logs y temporales
 *.log
 /tmp/
+
+# JSON reports
+*.json
+reporte_*.json
+
+# Model files (llama.cpp, etc.)
+*.gguf
+*.safetensors
+*.bin
+
+# Environment (prod/ci)
+.env

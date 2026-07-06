@@ -1,73 +1,14 @@
 #!/usr/bin/env python3
-import requests
+"""Prueba básica de tool calling con llama.cpp."""
 import json
 import sys
-from typing import Dict, List, Optional
+from typing import Any
+
+import requests
+
+from tools_defs import TOOLS
 
 SERVER = "http://localhost:8080/v1"
-
-# ---------- Herramientas de prueba ----------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Obtiene el clima actual de una ciudad",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "Nombre de la ciudad"}
-                },
-                "required": ["city"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Busca información en la web",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer", "default": 10}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_email",
-            "description": "Envía un correo electrónico",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string"},
-                    "subject": {"type": "string"},
-                    "body": {"type": "string"}
-                },
-                "required": ["to", "subject", "body"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_code",
-            "description": "Ejecuta código Python y devuelve la salida",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Código Python a ejecutar"}
-                },
-                "required": ["code"]
-            }
-        }
-    }
-]
 
 # ---------- Casos de prueba ----------
 TEST_CASES = [
@@ -92,19 +33,23 @@ TEST_CASES = [
     {
         "description": "Ejecutar código",
         "messages": [{"role": "user", "content": "Ejecuta: print(2+2)"}],
-        "expected_tool": "run_code",
+        "expected_tool": "run_python_code",
         "expected_args": {"code": "print(2+2)"}
     }
 ]
 
 # ---------- Llamada al API ----------
-def chat_completion(messages, tools, tool_choice="auto"):
+def chat_completion(
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]],
+    tool_choice: str = "auto",
+) -> dict[str, Any] | None:
     payload = {
         "model": "cualquiera",
         "messages": messages,
         "tools": tools,
         "tool_choice": tool_choice,
-        "temperature": 0
+        "temperature": 0,
     }
     try:
         resp = requests.post(f"{SERVER}/chat/completions", json=payload, timeout=60)
@@ -115,7 +60,7 @@ def chat_completion(messages, tools, tool_choice="auto"):
         return None
 
 # ---------- Verificación ----------
-def check_tool_call(case, response):
+def check_tool_call(case: dict[str, Any], response: dict[str, Any] | None) -> tuple[bool, str]:
     """Compara la respuesta real con la esperada. Devuelve (éxito, detalle)."""
     if not response:
         return False, "Sin respuesta"
@@ -126,6 +71,9 @@ def check_tool_call(case, response):
     tool_calls = choice.get("message", {}).get("tool_calls", [])
     if not tool_calls:
         return False, "No hay tool_calls en el mensaje"
+    if len(tool_calls) != 1:
+        names = [c.get("function", {}).get("name", "desconocida") for c in tool_calls]
+        return False, f"Se esperaba una sola tool_call, recibidas {len(tool_calls)}: {names}"
     call = tool_calls[0]  # solo evaluamos la primera
     func = call.get("function", {})
     name = func.get("name", "")
@@ -148,15 +96,23 @@ def check_tool_call(case, response):
             return False, f"Falta argumento '{key}' en {args}"
         actual_val = args[key]
         # Comparación flexible (cadena contiene valor esperado)
-        if isinstance(expected_val, str) and expected_val.lower() not in str(actual_val).lower():
-            return False, f"Valor de '{key}': '{actual_val}' no contiene '{expected_val}'"
+        if isinstance(expected_val, str):
+            actual_str = str(actual_val).strip()
+            expected_str = expected_val.strip()
+            strict_keys = {"to", "subject", "body", "code"}
+            strict_tools = {"send_email", "run_python_code"}
+            if key in strict_keys or name in strict_tools:
+                if actual_str != expected_str:
+                    return False, f"Valor de '{key}': '{actual_val}' != '{expected_val}'"
+            elif expected_str.lower() not in actual_str.lower():
+                return False, f"Valor de '{key}': '{actual_val}' no contiene '{expected_val}'"
         elif not isinstance(expected_val, str) and actual_val != expected_val:
             return False, f"Valor de '{key}': {actual_val} != {expected_val}"
     
     return True, f"Correcto → {name}({args})"
 
 # ---------- Ejecutar pruebas ----------
-def run_tests():
+def run_tests() -> None:
     print("🔧 Probando herramientas con llama.cpp\n")
     success = 0
     for case in TEST_CASES:
@@ -171,7 +127,7 @@ def run_tests():
     print(f"Resultado: {success}/{len(TEST_CASES)} pruebas correctas")
 
 # ---------- Extras: concurrencia y mezcla de herramientas ----------
-def test_multiple_tools_same_prompt():
+def test_multiple_tools_same_prompt() -> None:
     """Envía un prompt que podría requerir varias herramientas (modelo debe elegir una)."""
     print("🔀 Prueba de ambigüedad (debe elegir la más adecuada)")
     messages = [{"role": "user", "content": "Busca en internet el clima de París"}]

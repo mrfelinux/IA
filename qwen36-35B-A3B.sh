@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 llama-server \
    -hf unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-IQ3_XXS \

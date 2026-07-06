@@ -3,113 +3,15 @@
 Prueba de tool calling con llama.cpp.
 Evalúa si el modelo elige correctamente entre múltiples herramientas y genera argumentos JSON válidos.
 """
-import requests
 import json
 import sys
-from typing import Dict, List, Optional
+from typing import Any
+
+import requests
+
+from tools_defs import TOOLS, _check_args
 
 SERVER = "http://localhost:8080/v1"
-
-# ---------- Definición de herramientas (7) ----------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Obtiene el clima actual de una ciudad",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Busca información en Internet",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "num_results": {"type": "integer", "default": 5}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_email",
-            "description": "Envía un correo electrónico",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string"},
-                    "subject": {"type": "string"},
-                    "body": {"type": "string"}
-                },
-                "required": ["to", "subject", "body"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python_code",
-            "description": "Ejecuta código Python y devuelve el resultado",
-            "parameters": {
-                "type": "object",
-                "properties": {"code": {"type": "string"}},
-                "required": ["code"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Lee el contenido de un archivo del sistema",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Escribe contenido en un archivo",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_database",
-            "description": "Ejecuta una consulta SQL en la base de datos",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "database": {"type": "string", "default": "default"}
-                },
-                "required": ["query"]
-            }
-        }
-    }
-]
 
 # ---------- Casos de prueba ----------
 TEST_CASES = [
@@ -172,13 +74,18 @@ TEST_CASES = [
 ]
 
 # ---------- Función de llamada ----------
-def chat_completion(messages, tools, tool_choice="auto", temperature=0):
+def chat_completion(
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]],
+    tool_choice: str = "auto",
+    temperature: int = 0,
+) -> dict[str, Any] | None:
     payload = {
         "model": "cualquiera",
         "messages": messages,
         "tools": tools,
         "tool_choice": tool_choice,
-        "temperature": temperature
+        "temperature": temperature,
     }
     try:
         resp = requests.post(f"{SERVER}/chat/completions", json=payload, timeout=60)
@@ -189,7 +96,7 @@ def chat_completion(messages, tools, tool_choice="auto", temperature=0):
         return None
 
 # ---------- Evaluación ----------
-def evaluate(case, response):
+def evaluate(case: dict[str, Any], response: dict[str, Any] | None) -> tuple[bool, str]:
     if not response:
         return False, "Sin respuesta"
     choice = response.get("choices", [{}])[0]
@@ -201,6 +108,9 @@ def evaluate(case, response):
     tool_calls = choice["message"].get("tool_calls", [])
     if not tool_calls:
         return False, "No se encontraron tool_calls"
+    if len(tool_calls) != 1:
+        names = [c.get("function", {}).get("name", "desconocida") for c in tool_calls]
+        return False, f"Se esperaba una sola tool_call, recibidas {len(tool_calls)}: {names}"
     call = tool_calls[0]
     func = call.get("function", {})
     name = func.get("name")
@@ -222,14 +132,22 @@ def evaluate(case, response):
             return False, f"Falta argumento '{key}'"
         actual = args[key]
         # Comprobación flexible para cadenas
-        if isinstance(expected_val, str) and expected_val.lower() not in str(actual).lower():
-            return False, f"Argumento '{key}': '{actual}' no contiene '{expected_val}'"
+        if isinstance(expected_val, str):
+            actual_str = str(actual).strip()
+            expected_str = expected_val.strip()
+            strict_keys = {"path", "to", "subject", "body", "query", "code"}
+            strict_tools = {"write_file", "read_file", "send_email", "query_database", "run_python_code"}
+            if key in strict_keys or name in strict_tools:
+                if actual_str != expected_str:
+                    return False, f"Argumento '{key}': '{actual}' != '{expected_val}'"
+            elif expected_str.lower() not in actual_str.lower():
+                return False, f"Argumento '{key}': '{actual}' no contiene '{expected_val}'"
         elif not isinstance(expected_val, str) and actual != expected_val:
             return False, f"Argumento '{key}': {actual} != {expected_val}"
     return True, f"OK → {name}({args})"
 
 # ---------- Ejecutar todas las pruebas ----------
-def run_all():
+def run_all() -> None:
     print("🔧 Prueba de tool calling con 7 herramientas\n")
     passed = 0
     for case in TEST_CASES:

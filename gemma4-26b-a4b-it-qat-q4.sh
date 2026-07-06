@@ -1,3 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+export GGML_VK_ALLOW_GRAPHICS_QUEUE=1
+
 llama-server \
 -hf google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q4_0 \
 -ngl 99 \
@@ -15,6 +20,5 @@ llama-server \
 --jinja \
 --metrics \
 --host 0.0.0.0 \
--n 2048 \
+-n -1 \
 --reasoning-preserve
-

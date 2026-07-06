@@ -138,36 +138,48 @@ def extraer_json(respuesta: str) -> str:
 
     # 3. Buscar objeto/array JSON con balanceado de llaves/corchetes
     for start_char, end_char in [('{', '}'), ('[', ']')]:
-        start_idx = respuesta.find(start_char)
-        if start_idx == -1:
-            continue
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start_idx, len(respuesta)):
-            ch = respuesta[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == '\\' and in_string:
-                escape_next = True
-                continue
-            if ch == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == start_char:
-                depth += 1
-            elif ch == end_char:
-                depth -= 1
-                if depth == 0:
-                    candidate = respuesta[start_idx:i + 1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except json.JSONDecodeError:
-                        break
+        search_pos = 0
+        while True:
+            start_idx = respuesta.find(start_char, search_pos)
+            if start_idx == -1:
+                break
+            depth = 0
+            in_string = False
+            escape_next = False
+            i = start_idx
+            while i < len(respuesta):
+                ch = respuesta[i]
+                if escape_next:
+                    escape_next = False
+                    i += 1
+                    continue
+                if ch == '\\' and in_string:
+                    escape_next = True
+                    i += 1
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    i += 1
+                    continue
+                if in_string:
+                    i += 1
+                    continue
+                if ch == start_char:
+                    depth += 1
+                elif ch == end_char:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = respuesta[start_idx:i + 1]
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except json.JSONDecodeError:
+                            search_pos = i + 1
+                            break  # busca siguiente start_char
+                i += 1
+            else:
+                # Inner loop terminó sin break — no hay más candidatos
+                break
 
     return respuesta.strip()
 
@@ -181,6 +193,33 @@ def calcular_score(parte_a: bool, parte_b: bool) -> float:
             return 0.5
         case _:
             return 0.0
+
+
+def _codigo_python_parseado(respuesta: str) -> tuple[str, ast.Module | None, str | None]:
+    """Extrae y parsea código Python, devolviendo el error sin lanzar excepción."""
+    codigo = extraer_codigo_python(respuesta)
+    if not codigo.strip():
+        return codigo, None, "No se encontró código Python."
+    try:
+        return codigo, ast.parse(codigo), None
+    except SyntaxError as e:
+        return codigo, None, f"Error de sintaxis: {e}"
+
+
+def _python_sin_comentarios(codigo: str) -> str:
+    lineas = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
+    return '\n'.join(lineas)
+
+
+def _ast_tiene_import(tree: ast.Module, modulo: str) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == modulo or alias.name.startswith(f"{modulo}.") for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == modulo or (node.module or "").startswith(f"{modulo}."):
+                return True
+    return False
 
 
 # ─── Funciones de validación ─────────────────────────────────────────────────
@@ -210,19 +249,53 @@ def validar_bash(respuesta: str) -> ValidationTuple:
 
 
 def validar_python(respuesta: str) -> ValidationTuple:
-    codigo = extraer_codigo_python(respuesta)
-    if not codigo.strip():
-        return False, "No se encontró código Python.", 0.0
-    try:
-        ast.parse(codigo)
-        tiene_imports = "import " in codigo or "from " in codigo
-        score = 1.0 if tiene_imports else 0.8
-        msg = "Código Python sintácticamente válido."
-        if not tiene_imports:
-            msg += " (sin imports detectados)"
-        return True, msg, score
-    except SyntaxError as e:
-        return False, f"Error de sintaxis: {e}", 0.0
+    codigo, tree, error = _codigo_python_parseado(respuesta)
+    if error or tree is None:
+        return False, error or "Código Python inválido.", 0.0
+
+    codigo_lower = codigo.lower()
+    funciones = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    nombres_func = {f.name.lower() for f in funciones}
+
+    tiene_funcion_astar = any(
+        "astar" in nombre or "a_star" in nombre or "aestrella" in nombre
+        for nombre in nombres_func
+    )
+    tiene_heuristica = (
+        any("heur" in nombre or "manhattan" in nombre for nombre in nombres_func)
+        or any(p in codigo_lower for p in ("heurística", "heuristica", "manhattan", "abs("))
+    )
+    tiene_cola_prioridad = (
+        _ast_tiene_import(tree, "heapq")
+        or any(p in codigo_lower for p in ("heappush", "heappop", "priorityqueue", "priority queue"))
+    )
+    tiene_vecinos_grid = any(
+        p in codigo_lower
+        for p in ("vecinos", "neighbors", "directions", "movimientos", "grid", "cuadrícula", "cuadricula")
+    )
+    reconstruye_camino = any(
+        p in codigo_lower
+        for p in ("came_from", "parent", "padre", "reconstruct", "reconstru", "path.append", "camino")
+    )
+    maneja_costes = any(
+        p in codigo_lower
+        for p in ("g_score", "f_score", "cost", "costo", "distancia", "tentative")
+    )
+
+    checks = [
+        (tiene_funcion_astar, "función A*/a_star"),
+        (tiene_heuristica, "heurística"),
+        (tiene_cola_prioridad, "cola de prioridad"),
+        (tiene_vecinos_grid, "vecinos de cuadrícula"),
+        (reconstruye_camino, "reconstrucción de camino"),
+        (maneja_costes, "costes g/f o distancias"),
+    ]
+    score = sum(ok for ok, _ in checks) / len(checks)
+    faltan = [nombre for ok, nombre in checks if not ok]
+
+    if score >= 0.85:
+        return True, "Implementación A* plausible: estructura, heurística, prioridad y reconstrucción detectadas.", round(score, 2)
+    return False, f"A* incompleto o no verificable. Faltan: {', '.join(faltan)}.", round(score, 2)
 
 
 def validar_json(respuesta: str) -> ValidationTuple:
@@ -250,16 +323,16 @@ def validar_json(respuesta: str) -> ValidationTuple:
             argumentos = data.get("input", data.get("arguments", {}))
 
         if not nombre_funcion:
-            return True, "JSON válido pero sin nombre de función.", 0.3
+            return False, "JSON válido pero sin nombre de función.", 0.3
 
         # Verificar que la función sea la esperada
         funcion_esperada = "buscar_texto_en_archivos"
         if nombre_funcion.lower() != funcion_esperada.lower():
-            return True, f"JSON válido pero función inesperada: '{nombre_funcion}'.", 0.5
+            return False, f"JSON válido pero función inesperada: '{nombre_funcion}'.", 0.5
 
         # Verificar argumentos requeridos
         if not isinstance(argumentos, dict):
-            return True, "JSON válido pero argumentos no son objeto.", 0.5
+            return False, "JSON válido pero argumentos no son objeto.", 0.5
 
         args_lower = {k.lower(): v for k, v in argumentos.items()}
         campos_ok = sum(1 for c in ("directorio", "extension", "texto_busqueda") if c in args_lower)
@@ -268,9 +341,9 @@ def validar_json(respuesta: str) -> ValidationTuple:
         if campos_ok == 3:
             return True, "Tool call completa: función y 3 argumentos.", 1.0
         elif campos_ok > 0:
-            return True, f"Tool call parcial: {campos_ok}/3 argumentos.", score
+            return False, f"Tool call incompleta: {campos_ok}/3 argumentos.", score
         else:
-            return True, "Tool call sin argumentos esperados.", 0.5
+            return False, "Tool call sin argumentos esperados.", 0.5
 
     except json.JSONDecodeError:
         return False, "No es un JSON válido.", 0.0
@@ -321,25 +394,56 @@ def validar_sql(respuesta: str) -> ValidationTuple:
 
 
 def validar_pytest(respuesta: str) -> ValidationTuple:
-    tiene_assert = "assert" in respuesta
-    tiene_mark = "@pytest.mark" in respuesta or "pytest.mark" in respuesta
-    tiene_func_test = bool(re.search(r"def test_", respuesta))
+    codigo, tree, error = _codigo_python_parseado(respuesta)
+    if error or tree is None:
+        return False, error or "Código pytest inválido.", 0.0
 
-    partes = [tiene_assert, tiene_mark, tiene_func_test]
-    score = sum(partes) / len(partes)
+    codigo_lower = codigo.lower()
+    test_funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
+    asserts = [n for n in ast.walk(tree) if isinstance(n, ast.Assert)]
+    llama_validar_password = "validar_password" in codigo
+    importa_pytest = _ast_tiene_import(tree, "pytest") or "pytest." in codigo
+    parametriza = "pytest.mark.parametrize" in codigo or "@pytest.mark.parametrize" in codigo
 
-    faltan = [
-        nombre for tiene, nombre in [
-            (tiene_assert, "aserciones"),
-            (tiene_mark, "marcadores pytest"),
-            (tiene_func_test, "convención def test_"),
-        ]
-        if not tiene
+    constantes = [
+        n.value for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
     ]
+    cubre_vacio = any(s == "" for s in constantes) or "empty" in codigo_lower or "vacío" in codigo_lower or "vacio" in codigo_lower
+    passwords = [s for s in constantes if s or s == ""]
+    tiene_password_valida = any(len(s) >= 8 and any(ch.isdigit() for ch in s) and any(ch.isupper() for ch in s) for s in passwords)
+    tiene_password_corta = any(0 < len(s) < 8 for s in passwords)
+    tiene_password_sin_numero = any(len(s) >= 8 and not any(ch.isdigit() for ch in s) for s in passwords)
+    tiene_password_sin_mayuscula = any(len(s) >= 8 and any(ch.isdigit() for ch in s) and not any(ch.isupper() for ch in s) for s in passwords)
+    cubre_longitud = (
+        tiene_password_corta
+        or bool(re.search(r'\b7\b|\b8\b', codigo))
+        and any(p in codigo_lower for p in ("longitud", "length", "minima", "mínima", "short", "corto"))
+    )
+    cubre_numero = tiene_password_sin_numero or any(p in codigo_lower for p in ("numero", "número", "digit", "number", "sin_numero", "sin número"))
+    cubre_mayuscula = tiene_password_sin_mayuscula or any(p in codigo_lower for p in ("mayus", "mayúsc", "uppercase", "capital"))
+    tiene_casos_validos_invalidos = (
+        any(isinstance(n, ast.Constant) and n.value is True for n in ast.walk(tree))
+        and any(isinstance(n, ast.Constant) and n.value is False for n in ast.walk(tree))
+    ) or ("not validar_password" in codigo_lower and "validar_password" in codigo_lower) or tiene_password_valida
 
-    if faltan:
-        return False, f"Faltan: {', '.join(faltan)}", score
-    return True, "Completo: aserciones, marcadores, convención test_.", score
+    checks = [
+        (bool(test_funcs), "funciones def test_"),
+        (bool(asserts), "aserciones"),
+        (llama_validar_password, "llamadas a validar_password"),
+        (importa_pytest or parametriza, "uso explícito de pytest"),
+        (cubre_longitud, "longitud mínima"),
+        (cubre_numero, "presencia de número"),
+        (cubre_mayuscula, "presencia de mayúscula"),
+        (cubre_vacio, "string vacío"),
+        (tiene_casos_validos_invalidos, "casos válidos e inválidos"),
+    ]
+    score = sum(ok for ok, _ in checks) / len(checks)
+    faltan = [nombre for ok, nombre in checks if not ok]
+
+    if not faltan:
+        return True, "Suite pytest completa para validar_password.", 1.0
+    return False, f"Suite pytest incompleta. Faltan: {', '.join(faltan)}.", round(score, 2)
 
 
 def validar_go(respuesta: str) -> ValidationTuple:
@@ -443,6 +547,8 @@ def validar_traduccion(respuesta: str) -> ValidationTuple:
 
 def validar_seguridad(respuesta: str) -> ValidationTuple:
     resp_lower = respuesta.lower()
+    codigo_php_match = re.search(r'```(?:php)?\s*\n(.*?)\n```', respuesta, re.DOTALL | re.IGNORECASE)
+    codigo_php = codigo_php_match.group(1) if codigo_php_match else respuesta
 
     # Detectar identificación de vulnerabilidad
     vuln_identificada = any(v in resp_lower for v in (
@@ -451,71 +557,93 @@ def validar_seguridad(respuesta: str) -> ValidationTuple:
     ))
 
     # Detectar código seguro real (no solo mención)
-    tiene_prepared = bool(re.search(r'(prepare|prepared|stmt|statement)', resp_lower))
-    tiene_parameterized = bool(re.search(r'(parametriz|parameterized|\?\s*,|%\s*s)', resp_lower))
-    tiene_bind = bool(re.search(r'(bind_param|bindvalue|bind_value|\$\w+\s*=)', resp_lower))
-    tiene_escape = bool(re.search(r'(escape|sanitiz|mysql_real_escape|htmlspecialchars)', resp_lower))
+    tiene_prepare_real = bool(re.search(r'->\s*prepare\s*\(|mysqli_prepare\s*\(|new\s+PDO', codigo_php, re.IGNORECASE))
+    tiene_placeholder = bool(re.search(r'WHERE\s+id\s*=\s*(\?|:\w+)', codigo_php, re.IGNORECASE))
+    tiene_bind = bool(re.search(r'(bind_param|bindValue|bindParam)\s*\(', codigo_php, re.IGNORECASE))
+    tiene_execute = bool(re.search(r'->\s*execute\s*\(|mysqli_stmt_execute\s*\(', codigo_php, re.IGNORECASE))
 
     # Verificar que haya CÓDIGO seguro, no solo teoría
     tiene_codigo_php = bool(re.search(r'(\<\?php|\$conn|\$stmt|mysqli|pdo)', respuesta, re.IGNORECASE))
-    tiene_ejemplo = tiene_prepared or tiene_parameterized or tiene_bind or tiene_escape
+    tiene_ejemplo = tiene_prepare_real and tiene_placeholder and (tiene_bind or tiene_execute)
 
     score = calcular_score(vuln_identificada, tiene_ejemplo and tiene_codigo_php)
 
     if vuln_identificada and tiene_ejemplo and tiene_codigo_php:
         return True, "Vulnerabilidad identificada y mitigación con código seguro.", 1.0
     elif vuln_identificada and tiene_ejemplo:
-        return True, "Vulnerabilidad y mitigación detectadas (sin código PHP).", 0.7
+        return False, "Mitigación incompleta o sin código PHP verificable.", 0.7
     elif vuln_identificada:
-        return True, "Vulnerabilidad identificada pero mitigación débil.", 0.3
+        return False, "Vulnerabilidad identificada pero mitigación débil.", 0.3
     elif tiene_ejemplo:
-        return True, "Mitigación sin identificar vulnerabilidad explícita.", 0.5
+        return False, "Mitigación sin identificar vulnerabilidad explícita.", 0.5
     else:
         return False, "No se detectaron vulnerabilidades ni mitigaciones.", 0.0
 
 
 def validar_mutabilidad(respuesta: str) -> ValidationTuple:
-    if "def agregar_item" not in respuesta:
+    codigo, tree, error = _codigo_python_parseado(respuesta)
+    if error or tree is None:
+        return False, error or "Código Python inválido.", 0.0
+
+    funciones = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "agregar_item"]
+    if not funciones:
         return False, "No se encontró la función 'agregar_item'.", 0.0
 
-    usa_none = "lista=None" in respuesta or "lista = None" in respuesta
-    tiene_check_none = (
-        "if lista is None" in respuesta
-        or "if lista==None" in respuesta
-        or "lista = []" in respuesta
+    fn = funciones[0]
+    defaults = fn.args.defaults
+    usa_none = bool(defaults) and isinstance(defaults[-1], ast.Constant) and defaults[-1].value is None
+    usa_lista_mutable = any(isinstance(default, ast.List) for default in defaults)
+    tiene_check_none = any(
+        isinstance(n, ast.Compare)
+        and isinstance(n.left, ast.Name)
+        and n.left.id == "lista"
+        and any(isinstance(op, ast.Is) for op in n.ops)
+        and any(isinstance(comp, ast.Constant) and comp.value is None for comp in n.comparators)
+        for n in ast.walk(fn)
+    )
+    asigna_lista_nueva = any(
+        isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "lista" for t in n.targets)
+        and isinstance(n.value, ast.List)
+        for n in ast.walk(fn)
     )
 
-    match (usa_none, tiene_check_none):
+    match (usa_none, tiene_check_none and asigna_lista_nueva):
         case (True, True):
             return True, "Mutabilidad corregida: lista=None + inicialización condicional.", 1.0
         case (True, False):
-            return True, "Usa lista=None pero falta inicialización explícita.", 0.7
-        case _ if "lista=[]" in respuesta:
+            return False, "Usa lista=None pero falta inicialización condicional a lista nueva.", 0.7
+        case _ if usa_lista_mutable:
             return False, "Todavía usa lista=[] como valor por defecto (mutabilidad).", 0.0
         case _:
             return False, "No se detecta corrección del bug de mutabilidad.", 0.0
 
 
 def validar_optimizacion(respuesta: str) -> ValidationTuple:
-    codigo = extraer_codigo_python(respuesta)
+    codigo, tree, error = _codigo_python_parseado(respuesta)
+    if error or tree is None:
+        return False, error or "Código Python inválido.", 0.0
 
     # Verificar uso real de set/dict (no solo en comentarios)
-    lineas_codigo = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
-    codigo_sin_comentarios = '\n'.join(lineas_codigo)
+    codigo_sin_comentarios = _python_sin_comentarios(codigo)
 
-    usa_set = bool(re.search(r'\bset\s*\(', codigo_sin_comentarios))
-    usa_dict = bool(re.search(r'\bdict\s*\(|\{[^}]*for\s+\w+\s+in', codigo_sin_comentarios))
-    usa_comprension = bool(re.search(r'\{[^}]*for\s+\w+\s+in[^}]*\}', codigo_sin_comentarios))
+    funciones = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    tiene_funcion = any(f.name == "encontrar_duplicados" for f in funciones)
+    usa_set = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "set" for n in ast.walk(tree))
+    usa_dict = any(isinstance(n, (ast.Dict, ast.DictComp)) for n in ast.walk(tree))
+    usa_comprension = any(isinstance(n, (ast.SetComp, ast.DictComp, ast.ListComp)) for n in ast.walk(tree))
     usa_counter = 'Counter' in codigo_sin_comentarios
 
     # Verificar que no haya bucles anidados O(N^2)
-    tiene_bucles_anidados = bool(re.search(
-        r'for\s+\w+.*:.*\n\s+for\s+\w+', codigo_sin_comentarios
-    ))
+    tiene_bucles_anidados = any(
+        isinstance(n, (ast.For, ast.While))
+        and any(isinstance(child, (ast.For, ast.While)) for child in ast.walk(n) if child is not n)
+        for n in ast.walk(tree)
+    )
 
     optimizado = usa_set or usa_dict or usa_comprension or usa_counter
 
-    if optimizado:
+    if tiene_funcion and optimizado and not tiene_bucles_anidados:
         metodo = []
         if usa_set:
             metodo.append("set()")
@@ -523,46 +651,51 @@ def validar_optimizacion(respuesta: str) -> ValidationTuple:
             metodo.append("dict/comprensión")
         if usa_counter:
             metodo.append("Counter")
-        msg = f"Optimización O(N) detectada: {', '.join(metodo)}."
-        if tiene_bucles_anidados:
-            msg += " (⚠️ posible bucle anidado residual)"
-            return True, msg, 0.7
-        return True, msg, 1.0
-    else:
-        return False, "No se detecta uso de set/dict/Counter; podría seguir siendo O(N²).", 0.0
+        return True, f"Optimización O(N) plausible detectada: {', '.join(metodo)}.", 1.0
+
+    faltan = []
+    if not tiene_funcion:
+        faltan.append("función encontrar_duplicados")
+    if not optimizado:
+        faltan.append("uso de set/dict/Counter")
+    if tiene_bucles_anidados:
+        faltan.append("eliminar bucles anidados")
+    score = sum([tiene_funcion, optimizado, not tiene_bucles_anidados]) / 3
+    return False, f"Optimización incompleta. Faltan: {', '.join(faltan)}.", round(score, 2)
 
 
 def validar_retry(respuesta: str) -> ValidationTuple:
-    codigo = extraer_codigo_python(respuesta)
+    codigo, tree, error = _codigo_python_parseado(respuesta)
+    if error or tree is None:
+        return False, error or "Código Python inválido.", 0.0
 
     # Verificar implementación real de retry (no solo comentarios)
-    lineas_codigo = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
-    codigo_real = '\n'.join(lineas_codigo)
+    codigo_real = _python_sin_comentarios(codigo)
 
     # Buscar loop/bucle de reintentos
-    tiene_loop = bool(re.search(r'for\s+\w+\s+in\s+range\s*\(', codigo_real))
-    tiene_while = bool(re.search(r'while\s+', codigo_real))
-
-    # Variable de control de intentos
-    tiene_retry_var = bool(re.search(r'(retry|attempt|intento|intentos?)\s*[=<>]', codigo_real, re.IGNORECASE))
+    tiene_loop = any(isinstance(n, (ast.For, ast.While)) for n in ast.walk(tree))
+    tiene_requests_get = bool(re.search(r'requests\s*\.\s*get\s*\(', codigo_real))
+    limita_3_intentos = bool(re.search(r'range\s*\(\s*(?:1\s*,\s*)?4\s*\)|range\s*\(\s*3\s*\)|max_?retries\s*=\s*3', codigo_real, re.IGNORECASE))
+    maneja_5xx = bool(re.search(r'status_code\s*(?:>=|>|==)\s*5\d\d|5\d\d\s*<=\s*.*status_code|HTTPError|raise_for_status', codigo_real, re.IGNORECASE))
 
     # Backoff exponencial
-    tiene_sleep = 'sleep' in codigo_real.lower() or 'time.sleep' in codigo_real
-    tiene_backoff = bool(re.search(r'(backoff|exponencial|2\s*\*\*|2\s*\^\s*\w+|\*\s*2)', codigo_real, re.IGNORECASE))
+    tiene_sleep = bool(re.search(r'(?:time\s*\.)?sleep\s*\(', codigo_real))
+    tiene_backoff = bool(re.search(r'(backoff|2\s*\*\*|\*\s*2|delay\s*\*=)', codigo_real, re.IGNORECASE))
 
-    # Verificar que haya un mecanismo de reintento real
-    tiene_mecanismo = tiene_loop or tiene_while or tiene_retry_var
+    checks = [
+        (tiene_requests_get, "requests.get"),
+        (tiene_loop, "bucle de reintentos"),
+        (limita_3_intentos, "máximo 3 intentos"),
+        (maneja_5xx, "manejo de 5xx"),
+        (tiene_sleep, "sleep entre intentos"),
+        (tiene_backoff, "backoff exponencial"),
+    ]
+    score = sum(ok for ok, _ in checks) / len(checks)
+    faltan = [nombre for ok, nombre in checks if not ok]
 
-    if tiene_mecanismo and tiene_sleep and tiene_backoff:
+    if not faltan:
         return True, "Reintentos con backoff exponencial implementado.", 1.0
-    elif tiene_mecanismo and tiene_sleep:
-        return True, "Reintentos con sleep detectados (sin backoff claro).", 0.7
-    elif tiene_mecanismo:
-        return True, "Mecanismo de reintento detectado (sin sleep/backoff).", 0.5
-    elif tiene_retry_var or tiene_sleep:
-        return True, "Componentes de retry parciales.", 0.3
-    else:
-        return False, "No se detecta implementación real de reintentos.", 0.0
+    return False, f"Retry incompleto. Faltan: {', '.join(faltan)}.", round(score, 2)
 
 
 def validar_extraccion_info(respuesta: str) -> ValidationTuple:
@@ -1327,14 +1460,28 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     # Filtrar tests si se especificó --tests (soporte para rangos, ej. "1-5,7")
     items: list[tuple[str, dict[str, str]]] = list(TEST_SUITE.items())
     if cfg.tests_filter:
-        test_ids = []
+        test_ids: list[int] = []
         for part in cfg.tests_filter.split(","):
             part = part.strip()
             if "-" in part:
-                start, end = part.split("-")
-                test_ids.extend(range(int(start), int(end)+1))
+                try:
+                    start_str, end_str = part.split("-")
+                    start = int(start_str)
+                    end = int(end_str)
+                except ValueError:
+                    sys.exit(
+                        f"Error: '{part}' no es un rango válido. "
+                        "Use formato 'NUM-NUM' (ej: 1-5)."
+                    )
+                test_ids.extend(range(start, end + 1))
             else:
-                test_ids.append(int(part))
+                try:
+                    test_ids.append(int(part))
+                except ValueError:
+                    sys.exit(
+                        f"Error: '{part}' no es un número válido para --tests. "
+                        "Use enteros separados por coma (ej: 1,3,5)."
+                    )
         items = [(k, v) for i, (k, v) in enumerate(items, 1) if i in test_ids]
 
     total_tests = len(items)
