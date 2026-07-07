@@ -15,11 +15,11 @@ llama-server \
   --mlock \
   --host 0.0.0.0 --port 8080 \
   --metrics \
-  -np 1 \
+  -np 2 \
   --jinja \
   --no-mmap \
   --image-min-tokens 1024 \
-  -a qwen3.6-35B-A3B \
+  -a qwen3.6-35B-A3B-TEST2 \
   --ctx-checkpoints 16 \
   --cache-reuse 1024 \
   --slot-prompt-similarity 0.10 \
