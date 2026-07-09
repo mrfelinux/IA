@@ -5,7 +5,7 @@ llama-server \
    -hf unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-IQ3_XXS \
   --spec-type draft-mtp --spec-draft-n-max 2 \
   -ngl 99 \
-  -c $((192*1024)) \
+  -c $((160*1024)) \
   -fa on \
   -ctk q4_0 -ctv q4_0 \
   -b 1024 -ub 512 \
@@ -23,7 +23,6 @@ llama-server \
   --ctx-checkpoints 16 \
   --cache-reuse 1024 \
   --slot-prompt-similarity 0.10 \
-  -n 1024 \
   --reasoning-budget 1024 \
   --reasoning-budget-message "OK, I've thought enough. Let's answer now." \
   --chat-template-kwargs '{"preserve_thinking": true}' 

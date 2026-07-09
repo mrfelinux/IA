@@ -9,15 +9,16 @@ set -euo pipefail
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=1
 
 # Configuración del modelo y servidor
-MODEL_HF="protoLabsAI/Ornith-1.0-9B-MTP-GGUF:Q8_0"
+MODEL_HF="protoLabsAI/Ornith-1.0-9B-MTP-GGUF:Q4_K_M"
+
 # Alternativa de mayor calidad: "deepreinforce-ai/Ornith-1.0-9B-GGUF:UD-Q4_K_XL"
 PORT=8080
 HOST="0.0.0.0"
 
 # Parámetros de contexto y memoria
-CTX_SIZE=$((128*1024))
+CTX_SIZE=$((192*1024))
 NGL=99
-BATCH_SIZE=2048          # Puedes probar con 2048 si la VRAM lo permite
+BATCH_SIZE=1024          # Puedes probar con 2048 si la VRAM lo permite
 UBATCH_SIZE=512
 
 # Parámetros de caché KV
@@ -50,7 +51,7 @@ llama-server \
     --jinja \
     --metrics \
     --repeat-penalty 1.0 \
-    --chat-template-file ornith_template.jinja \
+    --chat-template-file templates/ornith_template.jinja \
     -np 1 \
     --chat-template-kwargs '{"enable_thinking":true}' \
     --spec-type draft-mtp --spec-draft-n-max 3

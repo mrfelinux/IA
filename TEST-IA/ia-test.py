@@ -15,11 +15,11 @@ import signal
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Never, Self
-from collections.abc import Callable
+from typing import Any, Self
 
 import requests
 
@@ -207,7 +207,10 @@ def _codigo_python_parseado(respuesta: str) -> tuple[str, ast.Module | None, str
 
 
 def _python_sin_comentarios(codigo: str) -> str:
-    lineas = [l for l in codigo.split('\n') if l.strip() and not l.strip().startswith('#')]
+    lineas = [
+        linea for linea in codigo.split('\n')
+        if linea.strip() and not linea.strip().startswith('#')
+    ]
     return '\n'.join(lineas)
 
 
@@ -293,7 +296,7 @@ def validar_python(respuesta: str) -> ValidationTuple:
     score = sum(ok for ok, _ in checks) / len(checks)
     faltan = [nombre for ok, nombre in checks if not ok]
 
-    if score >= 0.85:
+    if score >= 5/6:
         return True, "Implementación A* plausible: estructura, heurística, prioridad y reconstrucción detectadas.", round(score, 2)
     return False, f"A* incompleto o no verificable. Faltan: {', '.join(faltan)}.", round(score, 2)
 
@@ -350,8 +353,6 @@ def validar_json(respuesta: str) -> ValidationTuple:
 
 
 def validar_sql(respuesta: str) -> ValidationTuple:
-    resp_upper = respuesta.upper()
-
     # Detectar window functions
     tiene_over = bool(re.search(r'\bOVER\s*\(', respuesta, re.IGNORECASE))
     tiene_row_number = bool(re.search(r'\bROW_NUMBER\s*\(', respuesta, re.IGNORECASE))
@@ -362,8 +363,6 @@ def validar_sql(respuesta: str) -> ValidationTuple:
     # Detectar estructura SQL válida
     tiene_select = bool(re.search(r'\bSELECT\b', respuesta, re.IGNORECASE))
     tiene_from = bool(re.search(r'\bFROM\b', respuesta, re.IGNORECASE))
-    tiene_join = bool(re.search(r'\b(?:INNER\s+)?JOIN\b', respuesta, re.IGNORECASE))
-    tiene_group = bool(re.search(r'\bGROUP\s+BY\b', respuesta, re.IGNORECASE))
 
     # Verificar referencias a tablas del test
     tiene_empleados = bool(re.search(r'\bempleados?\b', respuesta, re.IGNORECASE))
@@ -507,7 +506,9 @@ def validar_rust(respuesta: str) -> ValidationTuple:
         partes.append(", use detectado")
 
     msg = ". ".join(partes) + f". Score: {score:.2f}"
-    return True, msg, score
+    if score >= 0.5:
+        return True, msg, score
+    return False, msg, score
 
 
 def validar_js(respuesta: str) -> ValidationTuple:
@@ -522,7 +523,7 @@ def validar_js(respuesta: str) -> ValidationTuple:
         case (True, True):
             return True, "HTTP + async/await detectados.", score
         case (True, False):
-            return True, "HTTP sin async detectado.", 0.5
+            return True, "HTTP sin async detectado.", score
         case _:
             return False, "No se detectaron peticiones HTTP.", 0.0
 
@@ -565,8 +566,6 @@ def validar_seguridad(respuesta: str) -> ValidationTuple:
     # Verificar que haya CÓDIGO seguro, no solo teoría
     tiene_codigo_php = bool(re.search(r'(\<\?php|\$conn|\$stmt|mysqli|pdo)', respuesta, re.IGNORECASE))
     tiene_ejemplo = tiene_prepare_real and tiene_placeholder and (tiene_bind or tiene_execute)
-
-    score = calcular_score(vuln_identificada, tiene_ejemplo and tiene_codigo_php)
 
     if vuln_identificada and tiene_ejemplo and tiene_codigo_php:
         return True, "Vulnerabilidad identificada y mitigación con código seguro.", 1.0
@@ -664,6 +663,74 @@ def validar_optimizacion(respuesta: str) -> ValidationTuple:
     return False, f"Optimización incompleta. Faltan: {', '.join(faltan)}.", round(score, 2)
 
 
+def _constante_entera(node: ast.AST | None) -> int | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    return None
+
+
+def _max_retries_default_3(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = _constante_entera(node.value)
+            if value != 3:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id in {"max_retries", "max_retry"} for target in targets):
+                return True
+
+        if isinstance(node, ast.FunctionDef):
+            positional_args = node.args.posonlyargs + node.args.args
+            defaults = [None] * (len(positional_args) - len(node.args.defaults)) + list(node.args.defaults)
+            for arg, default in zip(positional_args, defaults, strict=True):
+                if arg.arg in {"max_retries", "max_retry"} and default is not None and _constante_entera(default) == 3:
+                    return True
+            for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
+                if arg.arg in {"max_retries", "max_retry"} and default is not None and _constante_entera(default) == 3:
+                    return True
+    return False
+
+
+def _suma_max_retries_mas_uno(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Add)
+        and isinstance(node.left, ast.Name)
+        and node.left.id in {"max_retries", "max_retry"}
+        and _constante_entera(node.right) == 1
+    )
+
+
+def _range_limita_3_intentos(tree: ast.Module) -> bool:
+    max_retries_es_3 = _max_retries_default_3(tree)
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+        ):
+            continue
+
+        args = node.args
+        if len(args) == 1:
+            if _constante_entera(args[0]) == 3:
+                return True
+            if (
+                max_retries_es_3
+                and isinstance(args[0], ast.Name)
+                and args[0].id in {"max_retries", "max_retry"}
+            ):
+                return True
+        elif len(args) >= 2:
+            start = _constante_entera(args[0])
+            stop = _constante_entera(args[1])
+            if start == 1 and stop == 4:
+                return True
+            if start == 1 and max_retries_es_3 and _suma_max_retries_mas_uno(args[1]):
+                return True
+    return False
+
+
 def validar_retry(respuesta: str) -> ValidationTuple:
     codigo, tree, error = _codigo_python_parseado(respuesta)
     if error or tree is None:
@@ -675,9 +742,14 @@ def validar_retry(respuesta: str) -> ValidationTuple:
     # Buscar loop/bucle de reintentos
     tiene_loop = any(isinstance(n, (ast.For, ast.While)) for n in ast.walk(tree))
     tiene_requests_get = bool(re.search(r'requests\s*\.\s*get\s*\(', codigo_real))
-    limita_3_intentos = bool(re.search(r'range\s*\(\s*(?:1\s*,\s*)?4\s*\)|range\s*\(\s*3\s*\)|max_?retries\s*=\s*3', codigo_real, re.IGNORECASE))
-    maneja_5xx = bool(re.search(r'status_code\s*(?:>=|>|==)\s*5\d\d|5\d\d\s*<=\s*.*status_code|HTTPError|raise_for_status', codigo_real, re.IGNORECASE))
-
+    limita_3_intentos = _range_limita_3_intentos(tree) or _max_retries_default_3(tree)
+    maneja_5xx = bool(re.search(
+        r'status_code\s*(?:>=\s*500|>\s*499|==\s*500)'
+        r'|500\s*<=\s*[\w\.]*status_code'
+        r'|raise_for_status|HTTPError',
+        codigo_real,
+        re.IGNORECASE,
+    ))
     # Backoff exponencial
     tiene_sleep = bool(re.search(r'(?:time\s*\.)?sleep\s*\(', codigo_real))
     tiene_backoff = bool(re.search(r'(backoff|2\s*\*\*|\*\s*2|delay\s*\*=)', codigo_real, re.IGNORECASE))
@@ -748,7 +820,7 @@ def validar_extraccion_info(respuesta: str) -> ValidationTuple:
         elif valores_ok >= 2:
             return True, f"Entidades parciales: {', '.join(claves_encontradas.keys())}.", score
         else:
-            return True, "Entidades encontradas pero con valores vacíos.", 0.3
+            return False, "Entidades encontradas pero con valores vacíos.", 0.3
 
     except json.JSONDecodeError:
         return False, "No es un JSON válido.", 0.0
@@ -844,12 +916,6 @@ def validar_logica(respuesta: str) -> ValidationTuple:
         resp_lower
     ))
 
-    # Detectar que zorro y grano quedan separados
-    tiene_separacion = bool(re.search(
-        r'(zorro.{1,20}grano|grano.{1,20}zorro|deja.{1,20}zorro.{1,20}grano)',
-        resp_lower
-    ))
-
     # Verificar que la secuencia sea lógica
     partes = [tiene_personajes, tiene_paso1, tiene_retorno]
     score = sum(partes) / len(partes)
@@ -908,7 +974,7 @@ def validar_resumen(respuesta: str) -> ValidationTuple:
     palabras = respuesta.strip().split()
     cant_palabras = len(palabras)
     
-    cumple_longitud = 15 <= cant_palabras <= 105
+    cumple_longitud = 15 <= cant_palabras <= 100
     
     resp_lower = respuesta.lower()
     tiene_tema = "ia" in resp_lower or "inteligencia" in resp_lower
@@ -945,10 +1011,14 @@ def validar_explicacion(respuesta: str) -> ValidationTuple:
     tiene_ologn = "o(log n)" in resp_lower or "o(log(n))" in resp_lower or "o(logn)" in resp_lower
     
     ejemplos_encontrados = []
-    if tiene_o1: ejemplos_encontrados.append("O(1)")
-    if tiene_on: ejemplos_encontrados.append("O(n)")
-    if tiene_on2: ejemplos_encontrados.append("O(n^2)")
-    if tiene_ologn: ejemplos_encontrados.append("O(log n)")
+    if tiene_o1:
+        ejemplos_encontrados.append("O(1)")
+    if tiene_on:
+        ejemplos_encontrados.append("O(n)")
+    if tiene_on2:
+        ejemplos_encontrados.append("O(n^2)")
+    if tiene_ologn:
+        ejemplos_encontrados.append("O(log n)")
     
     todos_ejemplos = len(ejemplos_encontrados) == 4
     
@@ -1535,16 +1605,17 @@ def evaluar_modelo(cfg: ServerConfig) -> None:
     # Resumen en consola
     if not cfg.quiet:
         print_tabla_resumen(resultados_informe)
+    nombre_modelo_final = nombre_modelo or "Desconocido"
     print_resumen_final(
-        nombre_modelo, resultados_informe,
+        nombre_modelo_final, resultados_informe,
         total_prompt_tokens, total_completion_tokens,
         tiempo_total, tps_promedio, tps_lista,
     )
 
     # Construir informe
-    modelo_sanitizado = sanitizar_nombre(nombre_modelo)
+    modelo_sanitizado = sanitizar_nombre(nombre_modelo_final)
     informe_final = _construir_informe(
-        nombre_modelo, resultados_informe, cfg, stats,
+        nombre_modelo_final, resultados_informe, cfg, stats,
         total_prompt_tokens, total_completion_tokens,
         tiempo_total, tps_promedio, tps_lista,
         interrumpido, metricas_parseadas,

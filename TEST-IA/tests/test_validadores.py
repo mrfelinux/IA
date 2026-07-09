@@ -4,6 +4,7 @@ Functions tested:
   - calcular_score       — score from two bools (1.0 / 0.5 / 0.0)
   - sanitizar_nombre     — sanitise model names for filenames
   - _codigo_python_parseado — extract and AST-parse python code
+  - validar_retry        — retry validation for resilient HTTP clients
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ _spec.loader.exec_module(_ia_test)
 calcular_score = _ia_test.calcular_score
 sanitizar_nombre = _ia_test.sanitizar_nombre
 _codigo_python_parseado = _ia_test._codigo_python_parseado
+validar_retry = _ia_test.validar_retry
 
 
 # ─── calcular_score ───────────────────────────────────────────────────────────
@@ -121,3 +123,100 @@ class TestCodigoPythonParseado:
         _, tree, error = _codigo_python_parseado("```python\nimport os\nprint(os.getpid())\n```")
         assert isinstance(tree, ast.Module)
         assert error is None
+
+
+# ─── validar_retry ────────────────────────────────────────────────────────────
+
+
+class TestValidarRetry:
+    def test_accepts_range_3_with_explicit_5xx_sleep_and_backoff(self):
+        respuesta = """```python
+import time
+import requests
+
+
+def get_with_retry(url):
+    delay = 1
+    for attempt in range(3):
+        response = requests.get(url)
+        if response.status_code >= 500:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        return response
+    return response
+```"""
+
+        ok, msg, score = validar_retry(respuesta)
+
+        assert ok, msg
+        assert score == 1.0
+
+    def test_accepts_range_1_4_with_explicit_5xx_sleep_and_backoff(self):
+        respuesta = """```python
+import time
+import requests
+
+
+def get_with_retry(url):
+    delay = 1
+    for attempt in range(1, 4):
+        response = requests.get(url)
+        if response.status_code > 499:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        return response
+    return response
+```"""
+
+        ok, msg, score = validar_retry(respuesta)
+
+        assert ok, msg
+        assert score == 1.0
+
+    def test_accepts_max_retries_3_with_explicit_5xx_sleep_and_backoff(self):
+        respuesta = """```python
+import time
+import requests
+
+
+def get_with_retry(url, max_retries: int = 3):
+    delay = 1
+    for attempt in range(max_retries):
+        response = requests.get(url)
+        if 500 <= response.status_code:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        return response
+    return response
+```"""
+
+        ok, msg, score = validar_retry(respuesta)
+
+        assert ok, msg
+        assert score == 1.0
+
+    def test_rejects_status_code_less_than_500_as_5xx_retry_proof(self):
+        respuesta = """```python
+import time
+import requests
+
+
+def get_with_retry(url):
+    delay = 1
+    for attempt in range(3):
+        response = requests.get(url)
+        if response.status_code < 500:
+            return response
+        time.sleep(delay)
+        delay *= 2
+    return response
+```"""
+
+        ok, msg, score = validar_retry(respuesta)
+
+        assert not ok
+        assert "manejo de 5xx" in msg
+        assert score < 1.0
